@@ -1,6 +1,8 @@
 # Audio modules
 
-Self-contained flake with the PipeWire audio stack:
+Self-contained flake with a PipeWire audio stack **and a CLI backend** —
+UIs (quickshell, waybar, whatever) are expected to be thin frontends over
+the `audio-*` commands, so you can build your own.
 
 - **`pipewire`** (also **`default`**) — PipeWire + WirePlumber with:
   - **RNNoise denoised virtual source** (`rnnoise_source`): the whole audio
@@ -17,6 +19,20 @@ Self-contained flake with the PipeWire audio stack:
     system audio in screen captures (note: this overrides the firefox
     package — omit or override if you build firefox differently).
   - rtkit, ALSA (+32-bit), PulseAudio emulation, noisetorch.
+- **`tools`** — the backend CLI: ~30 `audio-*` commands on PATH plus an
+  `audioctl` dispatcher (`audioctl help` lists them). Toggles/status for the
+  RNNoise bypass, mic blend, output duplication (MIX), USB headroom, the
+  xrun guard and auto-mic daemons, plus enumerators (sinks, sources, app
+  streams, blend mics, dup sinks) and level/VAD meters that stream values
+  for UI meters. Also runs the two daemons as user services:
+  - `audio-xrun-guard` — passive USB crackle guard; raises the USB sinks'
+    ALSA headroom on real underruns, decays it when quiet. Opt-in via flag
+    file (`audio-xrun-guard-toggle`).
+  - `auto-mic` — VAD-driven automatic mic switcher, idle until configured
+    (`~/.config/auto-mic/config.json`).
+
+  Declares `programs.audioctl.enable` (default true) — frontends can gate
+  their audio controls on it via home-manager's `osConfig`.
 
 ## Usage
 

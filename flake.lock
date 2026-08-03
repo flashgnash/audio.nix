@@ -2,6 +2,22 @@
   "nodes": {
     "nixpkgs": {
       "locked": {
+        "lastModified": 1785692966,
+        "narHash": "sha256-vUfIeBEfpbAfZ5zjgIkYk7eHBeVfCYVjLbWnMkseYnk=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "643809054d65fdd466a63e3155b8c498cb483c04",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_2": {
+      "locked": {
         "lastModified": 1772773019,
         "narHash": "sha256-E1bxHxNKfDoQUuvriG71+f+s/NT0qWkImXsYZNFFfCs=",
         "owner": "NixOS",
@@ -18,7 +34,7 @@
     },
     "pipewire-screenaudio": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs_2"
       },
       "locked": {
         "lastModified": 1774374599,
@@ -36,6 +52,7 @@
     },
     "root": {
       "inputs": {
+        "nixpkgs": "nixpkgs",
         "pipewire-screenaudio": "pipewire-screenaudio"
       }
     }

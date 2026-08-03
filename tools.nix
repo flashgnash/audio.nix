@@ -1,0 +1,1585 @@
+# Backend audio tools — extracted from the quickshell panel so any UI (or
+# plain shell) can drive the PipeWire stack. Each tool is a bin named
+# audio-<thing>; audioctl is a dispatcher over them.
+{ pkgs }:
+let
+  audio-naming-awk = ''
+    function _shorten_words(s,    parts, n, i, out) {
+      n = split(s, parts, /[[:space:]]+/)
+      if (n > 3) n = 3
+      out = ""
+      for (i = 1; i <= n; i++) out = (out == "") ? parts[i] : (out " " parts[i])
+      return out
+    }
+    # Cap s at limit chars, breaking at the last word boundary that fits.
+    # Used to keep bar labels from overflowing when no friendly label exists.
+    function _truncate_chars(s, limit,    cut, i, c) {
+      if (length(s) <= limit) return s
+      cut = limit
+      for (i = limit; i > 0; i--) {
+        c = substr(s, i, 1)
+        if (c == " " || c == "-" || c == "_") { cut = i - 1; break }
+      }
+      if (cut <= 0) cut = limit
+      return substr(s, 1, cut)
+    }
+    function friendly_label(port, card, device,    eld_path, line, mname, n) {
+      # NOTE: deliberately no "Built In" rule for analog-output-speaker /
+      # analog-input-mic ports — USB headsets, DACs and external analog gear
+      # all report those same port names, so the heuristic mislabelled half
+      # the devices as "Built In". Fall back to the real description instead.
+      if (port ~ /^hdmi-output-/) {
+        if (card != "" && device != "") {
+          eld_path = "/proc/asound/card" card "/eld#" device ".0"
+          mname = ""
+          while ((getline line < eld_path) > 0) {
+            if (line ~ /^monitor_name/) {
+              sub(/^monitor_name[\t ]+/, "", line)
+              mname = line
+              break
+            }
+          }
+          close(eld_path)
+          if (mname != "") return mname
+        }
+        n = port; sub(/^hdmi-output-/, "", n)
+        return "HDMI " (n + 1)
+      }
+      return ""
+    }
+    function display_name(port, card, device, desc,    label) {
+      label = friendly_label(port, card, device)
+      if (label == "") return desc
+      return label " (" _shorten_words(desc) ")"
+    }
+    # Bar-style short name: friendly label if there is one, otherwise the
+    # raw description truncated to 8 chars at a word boundary (matches the
+    # old `getDefaultSink | trim 8` behavior so bar layout stays stable).
+    function short_name(port, card, device, desc,    label) {
+      label = friendly_label(port, card, device)
+      if (label != "") return label
+      return _truncate_chars(desc, 8)
+    }
+  '';
+
+  # Connects a BT device by MAC and then sets it as the default sink or source
+  bt-audio-connect-sh = pkgs.writeShellScriptBin "audio-bt-connect" ''
+    mac="$1"
+    kind="$2"   # "sink" or "source"
+    bluetoothctl connect "$mac" >/dev/null 2>&1
+    mac_under=$(echo "$mac" | tr ':' '_')
+    device=""
+    for i in $(seq 1 10); do
+      if [ "$kind" = "sink" ]; then
+        device=$(pactl list short sinks 2>/dev/null | awk '{print $2}' | grep "$mac_under" | head -1)
+      else
+        device=$(pactl list short sources 2>/dev/null | awk '{print $2}' | grep "$mac_under" | head -1)
+      fi
+      [ -n "$device" ] && break
+      sleep 0.5
+    done
+    [ -n "$device" ] && pactl "set-default-$kind" "$device"
+    echo "done"
+  '';
+
+  list-sinks-sh = pkgs.writeShellScriptBin "audio-list-sinks" ''
+    default=$(pactl get-default-sink 2>/dev/null)
+    pactl list sinks | awk -v def="$default" '
+      ${audio-naming-awk}
+      function emit(    bt, cur) {
+        # combined_out (output duplicator) is represented by the MIX toggle,
+        # not a device row.
+        if (name == "combined_out") return
+        bt  = (name ~ /^bluez_/) ? 1 : 0
+        cur = (name == def) ? "1" : "0"
+        printf "%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt
+      }
+      /^Sink #/  { if (name != "") emit()
+                   name = ""; desc = ""; port = ""; alsa_card = ""; alsa_device = "" }
+      /^\tName:/        { name = $2 }
+      /^\tDescription:/ { desc = substr($0, index($0, $2)) }
+      /^\tActive Port:/ { port = $3 }
+      /alsa\.card = /   { match($0, /"[^"]*"/); alsa_card   = substr($0, RSTART+1, RLENGTH-2) }
+      /alsa\.device = / { match($0, /"[^"]*"/); alsa_device = substr($0, RSTART+1, RLENGTH-2) }
+      END { if (name != "") emit() }
+    '
+    # Unconnected BT audio sinks (Audio Sink UUID: 0000110b)
+    bluetoothctl devices 2>/dev/null | awk '{print $2}' | while read -r mac; do
+      [ -z "$mac" ] && continue
+      mac_under=$(echo "$mac" | tr ':' '_')
+      pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -q "$mac_under" && continue
+      if bluetoothctl info "$mac" 2>/dev/null | grep -qi "0000110b"; then
+        name=$(bluetoothctl info "$mac" 2>/dev/null | awk '/^\tName:/{sub(/^\tName: /,""); print; exit}')
+        [ -z "$name" ] && name="$mac"
+        printf '__bt__%s|%s|0|1\n' "$mac" "$name"
+      fi
+    done
+  '';
+
+  # Print the node.name of the hardware mic currently feeding the RNNoise
+  # filter (i.e. what capture.rnnoise_source is linked to), or nothing if the
+  # filter isn't present. Used wherever rnnoise_source needs to resolve to the
+  # real device behind it (device list, bar label, toggle-off restore).
+  rnnoise-current-input-sh = pkgs.writeShellScriptBin "audio-rnnoise-current-input" ''
+    ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | awk '
+      /^capture\.rnnoise_source:input/ { f = 1; next }
+      f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); sub(/:[^:]*$/, "", s); print s; exit }
+      f && /^[^[:space:]]/ { f = 0 }
+    '
+  '';
+
+  list-sources-sh = pkgs.writeShellScriptBin "audio-list-sources" ''
+    default=$(pactl get-default-source 2>/dev/null)
+    # When noise cancellation is on, rnnoise_source is the default but it is
+    # represented by the toggle, not the device list. Highlight the hardware
+    # mic actually feeding the filter instead, and hide rnnoise_source itself.
+    if [ "$default" = "rnnoise_source" ]; then
+      fin=$(${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input)
+      [ -n "$fin" ] && default="$fin"
+    fi
+    pactl list sources | awk -v def="$default" '
+      ${audio-naming-awk}
+      function emit(    bt, cur) {
+        if (name == "" || name ~ /\.monitor$/ || name == "rnnoise_source" || name == "combined_mics") return
+        bt  = (name ~ /^bluez_/) ? 1 : 0
+        cur = (name == def) ? "1" : "0"
+        printf "%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt
+      }
+      /^Source #/ { emit()
+                    name = ""; desc = ""; port = ""; alsa_card = ""; alsa_device = "" }
+      /^\tName:/        { name = $2 }
+      /^\tDescription:/ { desc = substr($0, index($0, $2)) }
+      /^\tActive Port:/ { port = $3 }
+      /alsa\.card = /   { match($0, /"[^"]*"/); alsa_card   = substr($0, RSTART+1, RLENGTH-2) }
+      /alsa\.device = / { match($0, /"[^"]*"/); alsa_device = substr($0, RSTART+1, RLENGTH-2) }
+      END { emit() }
+    '
+    # Unconnected BT audio sources (Headset UUID: 0000111e)
+    bluetoothctl devices 2>/dev/null | awk '{print $2}' | while read -r mac; do
+      [ -z "$mac" ] && continue
+      mac_under=$(echo "$mac" | tr ':' '_')
+      pactl list short sources 2>/dev/null | awk '{print $2}' | grep -q "$mac_under" && continue
+      if bluetoothctl info "$mac" 2>/dev/null | grep -qi "0000111e"; then
+        name=$(bluetoothctl info "$mac" 2>/dev/null | awk '/^\tName:/{sub(/^\tName: /,""); print; exit}')
+        [ -z "$name" ] && name="$mac"
+        printf '__bt__%s|%s|0|1\n' "$mac" "$name"
+      fi
+    done
+  '';
+
+  # ── Output duplication (sink-side MIX) ──────────────────────────────────
+  # Dup ON = load pipewire-pulse's module-combine-sink (a `combined_out` sink
+  # forwarding to every physical output) and make it the default; OFF = restore
+  # the previous default and unload the module. The combine sink must NOT be
+  # loaded statically: its device streams either never wake the sinks (passive
+  # → apps hang) or keep them running from boot (non-passive → wedged the
+  # Arctis in permanent XRUN). On-demand, always-running sinks are correct —
+  # that's the whole point of MIX. State is derived from the live default
+  # (picking a single sink reads as dup-off).
+  outdup-status-sh = pkgs.writeShellScriptBin "audio-outdup-status" ''
+    if [ "$(pactl get-default-sink 2>/dev/null)" = "combined_out" ]; then
+      echo on
+    else
+      echo off
+    fi
+  '';
+
+  outdup-toggle-sh = pkgs.writeShellScriptBin "audio-outdup-toggle" ''
+    prevfile="$XDG_RUNTIME_DIR/qs-outdup-prev"
+    have_combined() {
+      pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF combined_out
+    }
+    default=$(pactl get-default-sink 2>/dev/null)
+    if [ "$default" = "combined_out" ]; then
+      prev=$(cat "$prevfile" 2>/dev/null)
+      pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF "$prev" || prev=""
+      [ -z "$prev" ] && prev=$(pactl list short sinks 2>/dev/null | awk '
+        $2 ~ /^(alsa_output|bluez_output)/ && $2 !~ /snd_aloop/ { print $2; exit }')
+      [ -z "$prev" ] && { echo "no sink to restore"; exit 1; }
+      pactl set-default-sink "$prev"
+      # Unload our combine sink (streams move back with the default swap
+      # above). Match on args so unrelated combine sinks are left alone.
+      pactl list short modules 2>/dev/null \
+        | awk '$2 == "module-combine-sink" && $0 ~ /sink_name=combined_out/ { print $1 }' \
+        | while read -r mid; do pactl unload-module "$mid"; done
+    else
+      [ -n "$default" ] && printf '%s\n' "$default" > "$prevfile"
+      if ! have_combined; then
+        pactl load-module module-combine-sink sink_name=combined_out >/dev/null
+        # Bounded wait for the sink to materialise before pointing the
+        # default at it (module load returns before the node exists).
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          have_combined && break
+          sleep 0.2
+        done
+      fi
+      pactl set-default-sink combined_out
+    fi
+    echo done
+  '';
+
+  # One line per output fed by combined_out, for the per-sink mixer rows in
+  # the output popup: `<streamId>|<sink node.name>|<display>|<vol%>` — the
+  # streamId is the duplicator's playback stream (a sink-input) on that sink,
+  # whose volume is that device's level in the duplicated output.
+  list-dup-sinks-sh = pkgs.writeShellScriptBin "audio-list-dup-sinks" ''
+    sinks=$(pactl list sinks | awk '
+      ${audio-naming-awk}
+      function emit() { if (name != "") printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
+      /^Sink #/ { emit(); idx = substr($2, 2); name=""; desc=""; port=""; alsa_card=""; alsa_device="" }
+      /^\tName:/        { name = $2 }
+      /^\tDescription:/ { desc = substr($0, index($0, $2)) }
+      /^\tActive Port:/ { port = $3 }
+      /alsa\.card = /   { match($0, /"[^"]*"/); alsa_card   = substr($0, RSTART+1, RLENGTH-2) }
+      /alsa\.device = / { match($0, /"[^"]*"/); alsa_device = substr($0, RSTART+1, RLENGTH-2) }
+      END { emit() }
+    ')
+    pactl list sink-inputs | awk -v SNK="$sinks" '
+      BEGIN {
+        n = split(SNK, lines, "\n")
+        for (i = 1; i <= n; i++) {
+          split(lines[i], f, "|")
+          snkname[f[1]] = f[2]; snkdisp[f[1]] = f[3]
+        }
+      }
+      function flush() {
+        if (id != "" && nodename ~ /^output\.combined_out/ && (snkidx in snkname))
+          printf "%s|%s|%s|%s\n", id, snkname[snkidx], snkdisp[snkidx], vol
+      }
+      /^Sink Input #/      { flush(); id = substr($3, 2); snkidx=""; vol=""; nodename="" }
+      /^[[:space:]]*Sink:/ { snkidx = $2 }
+      /^[[:space:]]*Volume:/ { if (vol == "") { match($0, /[0-9]+%/); vol = substr($0, RSTART, RLENGTH-1) } }
+      /node\.name = /      { split($0, a, "\""); nodename = a[2] }
+      END { flush() }
+    '
+  '';
+
+  # ── RNNoise input toggle ────────────────────────────────────────────────
+  # The pipewire filter-chain in flakes/audio/pipewire.nix exposes a virtual
+  # "rnnoise_source". Toggling = switching the default source between it and
+  # the hardware mic. The previous (hardware) source is remembered so toggling
+  # back restores exactly what was selected before.
+
+  # Point the filter's capture at a specific hardware mic. The filter capture
+  # (capture.rnnoise_source) is a passive stream that does NOT auto-follow the
+  # default once rnnoise_source itself is the default, so we retarget it
+  # explicitly via the node's target.object metadata.
+  rnnoise-set-input-sh = pkgs.writeShellScriptBin "audio-rnnoise-set-input" ''
+    mic="$1"
+    [ -z "$mic" ] && exit 0
+    capid=$(${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+      | ${pkgs.jq}/bin/jq -r '.[] | select(.info.props["node.name"] == "capture.rnnoise_source") | .id' \
+      | head -1)
+    [ -n "$capid" ] && ${pkgs.pipewire}/bin/pw-metadata "$capid" target.object "$mic" >/dev/null 2>&1
+    echo done
+  '';
+
+  # Denoise on/off is now an IN-GRAPH BYPASS (dry/wet mixer in the filter-chain,
+  # see flakes/audio/pipewire.nix) — NOT a default-device swap. rnnoise_source stays
+  # the default either way; we just flip the mixer gains. State is tracked in a
+  # runtime file (the filter-chain boots filtering-ON).
+  #   filter ON  -> Gain 1 (dry) = 0, Gain 2 (wet) = 1
+  #   filter OFF -> Gain 1 (dry) = 1, Gain 2 (wet) = 0
+  rnnoise-set-filter-sh = pkgs.writeShellScriptBin "audio-rnnoise-set-filter" ''
+    want="$1"   # "on" or "off"
+    statefile="$XDG_RUNTIME_DIR/qs-rnnoise-on"
+    id=$(${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+      | ${pkgs.jq}/bin/jq -r '.[] | select(.info.props["node.name"] == "rnnoise_source") | .id' \
+      | head -1)
+    [ -z "$id" ] && { echo "no rnnoise_source"; exit 1; }
+    if [ "$want" = "off" ]; then dry=1.0; wet=0.0; else dry=0.0; wet=1.0; fi
+    ${pkgs.pipewire}/bin/pw-cli set-param "$id" Props \
+      "{ params = [ \"mix:Gain 1\" $dry \"mix:Gain 2\" $wet ] }" >/dev/null 2>&1
+    printf '%s\n' "$want" > "$statefile"
+    # Tell the auto-mic daemon to re-evaluate (filter on/off changes whether the
+    # virtual source is the default vs. stepping aside to real devices).
+    ${pkgs.procps}/bin/pkill -HUP -f auto-mic-daemon.py 2>/dev/null || true
+    echo done
+  '';
+
+  rnnoise-toggle-sh = pkgs.writeShellScriptBin "audio-rnnoise-toggle" ''
+    statefile="$XDG_RUNTIME_DIR/qs-rnnoise-on"
+    cur=$(cat "$statefile" 2>/dev/null)
+    [ -z "$cur" ] && cur=on            # filter-chain boots ON
+    if [ "$cur" = "on" ]; then ${rnnoise-set-filter-sh}/bin/audio-rnnoise-set-filter off; else ${rnnoise-set-filter-sh}/bin/audio-rnnoise-set-filter on; fi
+  '';
+
+  rnnoise-status-sh = pkgs.writeShellScriptBin "audio-rnnoise-status" ''
+    cur=$(cat "$XDG_RUNTIME_DIR/qs-rnnoise-on" 2>/dev/null)
+    [ -z "$cur" ] && cur=on            # filter-chain boots ON
+    echo "$cur"
+  '';
+
+  # ── USB output headroom (device-side buffer) ────────────────────────────
+  # Extra ALSA buffer on USB sinks guards against xruns/crackle when the CPU
+  # is saturated (Star Citizen), at the cost of output latency (48 samples =
+  # 1ms at 48kHz). Applied live via the node Props param — no wireplumber
+  # restart — and tracked in a runtime file (devices boot at headroom 0, so
+  # rhythm games keep minimum latency unless the slider says otherwise).
+  usb-headroom-set-sh = pkgs.writeShellScriptBin "audio-headroom-set" ''
+    samples="$1"
+    case "$samples" in "" | *[!0-9]*) exit 1 ;; esac
+    for id in $(${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+      | ${pkgs.jq}/bin/jq '.[] | select((.info.props["node.name"] // "") | startswith("alsa_output.usb-")) | .id'); do
+      ${pkgs.pipewire}/bin/pw-cli set-param "$id" Props \
+        "{ params = [ \"api.alsa.headroom\" $samples ] }" >/dev/null 2>&1
+    done
+    printf '%s\n' "$samples" > "$XDG_RUNTIME_DIR/qs-usb-headroom"
+    echo done
+  '';
+
+  usb-headroom-status-sh = pkgs.writeShellScriptBin "audio-headroom-status" ''
+    cur=$(cat "$XDG_RUNTIME_DIR/qs-usb-headroom" 2>/dev/null)
+    [ -z "$cur" ] && cur=0
+    echo "$cur"
+  '';
+
+  # Passive crackle guard daemon (systemd user service `audio-xrun-guard`,
+  # see quickshell/default.nix; toggled by the AUTO chip next to the buf
+  # slider). Watches pw-top's xrun counter on USB sinks and escalates the
+  # headroom one step per burst of underruns (256 → 512 → 1024 → 2048,
+  # ≥5s apart); after 5 quiet minutes it steps back down towards 0. It reads
+  # the shared statefile before every change, so manual slider moves are
+  # respected as the new baseline, and every change it makes shows up on the
+  # slider. pw-top only receives profiler data while the graph is actually
+  # processing, so the daemon is effectively free when no audio plays.
+  audio-xrun-guard-sh = pkgs.writeShellScriptBin "audio-xrun-guard" ''
+    state="$XDG_RUNTIME_DIR/qs-usb-headroom"
+
+    cur() {
+      c=$(cat "$state" 2>/dev/null)
+      case "$c" in "" | *[!0-9]*) echo 0 ;; *) echo "$c" ;; esac
+    }
+
+    apply() {
+      ${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+        | ${pkgs.jq}/bin/jq '.[] | select((.info.props["node.name"] // "") | startswith("alsa_output.usb-")) | .id' \
+        | while read -r id; do
+            ${pkgs.pipewire}/bin/pw-cli set-param "$id" Props \
+              "{ params = [ \"api.alsa.headroom\" $1 ] }" >/dev/null 2>&1 || true
+          done
+      printf '%s\n' "$1" > "$state"
+    }
+
+    # awk emits a line whenever a USB sink's ERR (xrun) count increases; the
+    # column index is taken from pw-top's own header line rather than
+    # hard-coded, because the layout varies between pipewire versions (this
+    # one has W/Q and B/Q as separate columns, so ERR is field 9 — reading a
+    # fixed field 8 picked up the per-cycle load ratio and fired constantly).
+    # read -t turns 5 xrun-free minutes into a decay step.
+    ${pkgs.pipewire}/bin/pw-top -b 2>/dev/null \
+      | ${pkgs.gawk}/bin/awk '
+          $1 == "S" && $2 == "ID" {
+            for (i = 1; i <= NF; i++) if ($i == "ERR") erridx = i
+            next
+          }
+          erridx && $NF ~ /^alsa_output\.usb-/ {
+            if ($NF in last && $erridx > last[$NF]) { print "x"; fflush() }
+            last[$NF] = $erridx
+          }' \
+      | {
+        last_bump=0
+        while :; do
+          ret=0
+          read -r -t 300 _ || ret=$?
+          if [ "$ret" -eq 0 ]; then
+            now=$(date +%s)
+            [ $((now - last_bump)) -lt 5 ] && continue
+            last_bump=$now
+            c=$(cur)
+            if [ "$c" -lt 256 ]; then apply 256
+            elif [ "$c" -lt 2048 ]; then apply $((c * 2))
+            fi
+          elif [ "$ret" -gt 128 ]; then
+            c=$(cur)
+            [ "$c" -eq 0 ] && continue
+            n=$((c / 2)); [ "$n" -lt 256 ] && n=0
+            apply "$n"
+          else
+            break     # pw-top went away (pipewire restart) — service restarts us
+          fi
+        done
+      }
+  '';
+
+  # Guard on/off = whether the user service runs. The flag file makes the
+  # choice stick across logins (the unit's ConditionPathExists checks it).
+  xrun-guard-status-sh = pkgs.writeShellScriptBin "audio-xrun-guard-status" ''
+    if ${pkgs.systemd}/bin/systemctl --user is-active -q audio-xrun-guard 2>/dev/null; then
+      echo on
+    else
+      echo off
+    fi
+  '';
+
+  xrun-guard-toggle-sh = pkgs.writeShellScriptBin "audio-xrun-guard-toggle" ''
+    flag="''${XDG_CONFIG_HOME:-$HOME/.config}/qs-audio-xrun-guard-enabled"
+    if ${pkgs.systemd}/bin/systemctl --user is-active -q audio-xrun-guard 2>/dev/null; then
+      ${pkgs.systemd}/bin/systemctl --user stop audio-xrun-guard
+      rm -f "$flag"
+    else
+      touch "$flag"
+      ${pkgs.systemd}/bin/systemctl --user start audio-xrun-guard
+    fi
+    echo done
+  '';
+
+  # ── Mic blend (multi-mic mixing) toggle ─────────────────────────────────
+  # flakes/audio/pipewire.nix exposes `combined_mics`, a combine-stream source that
+  # mixes every physical mic. Blend ON = route it into the audio stack; OFF =
+  # back to the single mic that was selected before. There is deliberately no
+  # state file: on/off is DERIVED from the live graph (what actually feeds the
+  # stack), so picking a single mic in the device list naturally reads as
+  # blend-off without extra bookkeeping.
+  #
+  # Two routing modes, mirroring the rnnoise plumbing:
+  #  - system active (rnnoise_source is the default): retarget the filter's
+  #    capture at combined_mics — blend feeds THROUGH the denoiser.
+  #  - escape hatch (both filter and auto-switch off, real device is default):
+  #    set the default source to combined_mics directly.
+  micblend-status-sh = pkgs.writeShellScriptBin "audio-micblend-status" ''
+    default=$(pactl get-default-source 2>/dev/null)
+    if [ "$default" = "combined_mics" ]; then echo on; exit 0; fi
+    if [ "$default" = "rnnoise_source" ] \
+       && [ "$(${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input)" = "combined_mics" ]; then
+      echo on
+    else
+      echo off
+    fi
+  '';
+
+  micblend-set-sh = pkgs.writeShellScriptBin "audio-micblend-set" ''
+    want="$1"   # "on" or "off"
+    prevfile="$XDG_RUNTIME_DIR/qs-micblend-prev"
+    default=$(pactl get-default-source 2>/dev/null)
+    # First hardware mic, the fallback when there's no remembered previous mic.
+    first_mic() {
+      pactl list short sources 2>/dev/null | awk '
+        $2 ~ /^(alsa_input|bluez_input)/ { print $2; exit }'
+    }
+    if [ "$want" = "on" ]; then
+      if [ "$default" = "rnnoise_source" ]; then
+        cur=$(${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input)
+        [ -n "$cur" ] && [ "$cur" != "combined_mics" ] && printf '%s\n' "$cur" > "$prevfile"
+        ${rnnoise-set-input-sh}/bin/audio-rnnoise-set-input combined_mics
+      else
+        [ -n "$default" ] && [ "$default" != "combined_mics" ] && printf '%s\n' "$default" > "$prevfile"
+        pactl set-default-source combined_mics
+      fi
+    else
+      prev=$(cat "$prevfile" 2>/dev/null)
+      # Only restore a mic that still exists; otherwise fall back.
+      pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qxF "$prev" || prev=""
+      [ -z "$prev" ] && prev=$(first_mic)
+      [ -z "$prev" ] && { echo "no mic to restore"; exit 1; }
+      if [ "$default" = "rnnoise_source" ]; then
+        ${rnnoise-set-input-sh}/bin/audio-rnnoise-set-input "$prev"
+      else
+        pactl set-default-source "$prev"
+      fi
+    fi
+    echo done
+  '';
+
+  micblend-toggle-sh = pkgs.writeShellScriptBin "audio-micblend-toggle" ''
+    if [ "$(${micblend-status-sh}/bin/audio-micblend-status)" = "on" ]; then
+      ${micblend-set-sh}/bin/audio-micblend-set off
+    else
+      ${micblend-set-sh}/bin/audio-micblend-set on
+    fi
+  '';
+
+  # One line per mic feeding the combined_mics blend, for the per-mic mixer
+  # rows in the input popup: `<streamId>|<source node.name>|<display>|<vol%>`
+  # streamId is the combiner's capture stream (a source-output) for that mic —
+  # its volume IS the mic's level in the blend, the same knob pavucontrol
+  # shows on its Recording tab.
+  list-blend-mics-sh = pkgs.writeShellScriptBin "audio-list-blend-mics" ''
+    # idx|name|display for every source, to resolve each combiner stream's
+    # "Source:" index into the mic behind it.
+    sources=$(pactl list sources | awk '
+      ${audio-naming-awk}
+      function emit() { if (name != "") printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
+      /^Source #/ { emit(); idx = substr($2, 2); name=""; desc=""; port=""; alsa_card=""; alsa_device="" }
+      /^\tName:/        { name = $2 }
+      /^\tDescription:/ { desc = substr($0, index($0, $2)) }
+      /^\tActive Port:/ { port = $3 }
+      /alsa\.card = /   { match($0, /"[^"]*"/); alsa_card   = substr($0, RSTART+1, RLENGTH-2) }
+      /alsa\.device = / { match($0, /"[^"]*"/); alsa_device = substr($0, RSTART+1, RLENGTH-2) }
+      END { emit() }
+    ')
+    pactl list source-outputs | awk -v SRC="$sources" '
+      BEGIN {
+        n = split(SRC, lines, "\n")
+        for (i = 1; i <= n; i++) {
+          split(lines[i], f, "|")
+          srcname[f[1]] = f[2]; srcdisp[f[1]] = f[3]
+        }
+      }
+      function flush() {
+        if (id != "" && nodename ~ /^capture\.combined_mics/ && (srcidx in srcname))
+          printf "%s|%s|%s|%s\n", id, srcname[srcidx], srcdisp[srcidx], vol
+      }
+      /^Source Output #/     { flush(); id = substr($3, 2); srcidx=""; vol=""; nodename="" }
+      /^[[:space:]]*Source:/ { srcidx = $2 }
+      /^[[:space:]]*Volume:/ { if (vol == "") { match($0, /[0-9]+%/); vol = substr($0, RSTART, RLENGTH-1) } }
+      /node\.name = /        { split($0, a, "\""); nodename = a[2] }
+      END { flush() }
+    '
+  '';
+
+  # Whether the mic is actively being used — drives the red bar indicator.
+  # "yes" if mic-users (the spoof-resistant enumerator: real-mic capture by
+  # server-side topology + raw-device holders) reports anything NOT on the
+  # manual exclude list. Using the same source as the dropdown means the always-
+  # visible indicator is as hard to spoof as the list, and catches direct-ALSA.
+  #
+  # EXCLUDE: processes that read the mic but shouldn't flash the indicator (e.g.
+  # level meters). One per line; matched against the advertised name OR the exe
+  # basename. Edit this list to taste.
+  mic-inuse-sh = pkgs.writeShellScriptBin "audio-mic-inuse" ''
+        exclude='PulseAudio Volume Control
+    pavucontrol
+    .pavucontrol-wrapped'
+
+        inuse=no
+        while IFS='|' read -r kind name exe pid; do
+          [ -z "$kind" ] && continue
+          base="''${exe##*/}"
+          skip=no
+          while IFS= read -r ex; do
+            [ -z "$ex" ] && continue
+            if [ "$ex" = "$name" ] || [ "$ex" = "$base" ]; then skip=yes; break; fi
+          done <<EXCL
+    $exclude
+    EXCL
+          [ "$skip" = yes ] && continue
+          inuse=yes
+          break
+        done <<USERS
+    $(${mic-users-sh}/bin/audio-mic-users)
+    USERS
+        echo "$inuse"
+  '';
+
+  # Lists what is currently using the microphone, for the input dropdown. One
+  # line per user: `kind|displayName|exe|pid`.
+  #   kind = "pw"  → a PipeWire capture stream (normal apps)
+  #   kind = "raw" → a process holding the raw ALSA capture device that ISN'T
+  #                  PipeWire/WirePlumber (i.e. capturing directly, bypassing
+  #                  the graph) — surfaced as a warning row.
+  # Trust model: existence comes from the kernel fd table + server-side PipeWire
+  # topology, and FILTERING decisions use the kernel's view (the connected
+  # source's monitor flag, and each holder's real /proc/PID/exe) — never the
+  # client-set application.name / node.name / stream.monitor, which a process
+  # can spoof. The advertised name is shown in the list purely for readability;
+  # the exe (kernel truth) is what the UI reveals on hover. Defeated only by
+  # root/kernel-level access, which is out of scope.
+  mic-users-sh = pkgs.writeShellScriptBin "audio-mic-users" ''
+    # Field separator for the awk→read handoff. Must be NON-whitespace: a tab
+    # would be treated as IFS-whitespace and collapse empty fields, shifting
+    # columns. 0x1f (unit separator) never appears in the data.
+    SEP="$(printf '\037')"
+
+    # Source indices that are playback monitors (NOT real mics), from the
+    # server-side topology — not the spoofable client `stream.monitor` flag.
+    monitors=$(pactl list sources 2>/dev/null | awk '
+      /^Source #/                 { idx = substr($2, 2) }
+      /^[[:space:]]*Name:/        { if ($2 ~ /\.monitor$/) print idx }
+      /Monitor of Sink:/          { if ($0 !~ /n\/a/) print idx }
+    ' | sort -u)
+
+    is_monitor() {
+      for m in $monitors; do [ "$m" = "$1" ] && return 0; done
+      return 1
+    }
+
+    # Resolve an electron/chromium PID to a real product name (Vesktop, Discord,
+    # …) by walking up to the root electron process and reading its cmdline —
+    # the same approach the output app mixer uses. Generic electron apps all
+    # advertise application.name = "electron", which is useless on its own.
+    resolve_electron() {
+      local pid=$1 current=$1 last=$1 ppid exe cmdline
+      while true; do
+        ppid=$(awk '/^PPid:/{print $2}' "/proc/$current/status" 2>/dev/null)
+        [ -z "$ppid" ] || [ "$ppid" = "1" ] || [ "$ppid" = "0" ] && break
+        exe=$(readlink "/proc/$ppid/exe" 2>/dev/null)
+        case "$exe" in
+          *electron*|*chromium*) last=$ppid; current=$ppid ;;
+          *) break ;;
+        esac
+      done
+      cmdline=$(tr '\0' ' ' < "/proc/$last/cmdline" 2>/dev/null)
+      case "$cmdline" in
+        *[Vv]esktop*)  echo "Vesktop" ;;
+        *[Dd]iscord*)  echo "Discord" ;;
+        *[Ss]lack*)    echo "Slack" ;;
+        *[Oo]bsidian*) echo "Obsidian" ;;
+        *)
+          # Extract app name from a nix store path: /nix/store/hash-appname-ver/
+          echo "$cmdline" \
+            | sed -n 's|.*/nix/store/[^/]*/\([^/ ]*\).*|\1|p' \
+            | head -1 \
+            | sed 's/-[0-9].*//'
+          ;;
+      esac
+    }
+
+    {
+      # ── PipeWire capture streams ───────────────────────────────────────────
+      pactl list source-outputs 2>/dev/null | awk -v SEP="$SEP" '
+        function flush() {
+          if (id != "")
+            print id SEP src SEP corked SEP pid SEP appname SEP medianame SEP nodename SEP client
+        }
+        /^Source Output #/             { flush(); id=substr($3,2); src=""; corked=""; pid=""; appname=""; medianame=""; nodename=""; client="" }
+        /^[[:space:]]*Source:/         { src=$2 }
+        /^[[:space:]]*Corked:/         { corked=$2 }
+        /^[[:space:]]*Client:/         { client=$2 }
+        /application\.process\.id = /  { split($0,a,"\""); pid=a[2] }
+        /application\.name = /         { split($0,a,"\""); appname=a[2] }
+        /media\.name = /               { split($0,a,"\""); if (medianame=="") medianame=a[2] }
+        /node\.name = /                { split($0,a,"\""); nodename=a[2] }
+        END { flush() }
+      ' | while IFS="$SEP" read -r id src corked pid appname medianame nodename client; do
+        [ "$corked" = "yes" ] && continue
+        is_monitor "$src" && continue
+        # Our own bar level meter (qs-mic-level) and per-mic VAD taps (qs-vad) —
+        # never count them as mic users.
+        [ "$appname" = "qs-mic-level" ] && continue
+        [ "$appname" = "qs-vad" ] && continue
+        # The RNNoise filter's own passive capture: a server-side filter node
+        # has no Client (a real pulse/pipewire app always does, and can't fake
+        # "n/a"), so this can't be spoofed by naming a stream capture.rnnoise_source.
+        [ "$nodename" = "capture.rnnoise_source" ] && [ "$client" = "n/a" ] && continue
+        # The mic combiner's per-mic capture streams (see combined_mics in
+        # flakes/audio/pipewire.nix) — server-side too, same no-Client rule. Prefix
+        # match because PipeWire may uniquify duplicate stream node names.
+        case "$nodename" in capture.combined_mics*)
+          [ "$client" = "n/a" ] && continue ;;
+        esac
+        exe=""
+        [ -n "$pid" ] && exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+        name="$appname"
+        [ -z "$name" ] && name="$medianame"
+        [ -z "$name" ] && name="$nodename"
+        [ -z "$name" ] && name="unknown"
+        # Generic electron/chromium apps report themselves as "electron" — swap
+        # in the resolved product name (e.g. Vesktop) when we can find it.
+        case "$exe" in
+          *electron*|*chromium*)
+            resolved=$(resolve_electron "$pid")
+            [ -n "$resolved" ] && name="$resolved" ;;
+        esac
+        printf 'pw|%s|%s|%s\n' "$name" "$exe" "$pid"
+      done
+
+      # ── Raw capture-device holders (direct ALSA, bypassing PipeWire) ───────
+      # `find -lname` matches symlink targets in a SINGLE pass. A per-fd
+      # $(readlink) loop over every PID is O(thousands of forks) and took
+      # 15-40s, which both lagged the indicator and starved the dropdown's
+      # 1.5s poll (it got killed/restarted before finishing). Capture device
+      # nodes end in 'c' (playback nodes end in 'p').
+      find /proc/[0-9]*/fd -maxdepth 1 -lname '/dev/snd/pcmC*c' 2>/dev/null \
+        | while IFS= read -r fd; do
+            pid="''${fd#/proc/}"
+            pid="''${pid%%/*}"
+            exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+            base="''${exe##*/}"
+            # Filter legit holders by their REAL binary (exe), not comm/cmdline.
+            case "$base" in
+              pipewire|pipewire-pulse|wireplumber|pw-*) continue ;;
+            esac
+            printf 'raw|%s|%s|%s\n' "''${base:-unknown}" "$exe" "$pid"
+          done
+    } | sort -u   # collapse an app's multiple streams (e.g. per-source meters)
+  '';
+
+  # Reads s16-mono PCM on stdin in 50ms windows and prints one peak-level value
+  # per window (0..100, dBFS-mapped over a -50dB floor). Drives the live input
+  # meter on the bar mic icon.
+  mic-level-pl = pkgs.writeText "qs-mic-level.pl" ''
+    use strict; use warnings;
+    $| = 1;
+    my $rate  = 8000;
+    my $win   = int($rate * 0.05);   # 50ms window
+    my $bytes = $win * 2;            # s16 mono
+    binmode STDIN;
+    my $buf = "";
+    while (1) {
+        my $chunk;
+        my $n = read(STDIN, $chunk, $bytes);
+        last if !defined($n) || $n == 0;
+        $buf .= $chunk;
+        while (length($buf) >= $bytes) {
+            my $frame = substr($buf, 0, $bytes, "");
+            my @s = unpack("s<*", $frame);
+            my $peak = 0;
+            for my $v (@s) { my $a = $v < 0 ? -$v : $v; $peak = $a if $a > $peak; }
+            my $level = 0;
+            if ($peak > 0) {
+                my $db = 20 * log($peak / 32768) / log(10);
+                $level = ($db + 50) / 50 * 100;
+                $level = 0   if $level < 0;
+                $level = 100 if $level > 100;
+            }
+            print int($level), "\n";
+        }
+    }
+  '';
+
+  # Streams the live level of an audio device as one 0..100 number per ~50ms on
+  # stdout.
+  #   $1  parec device  (default @DEFAULT_SOURCE@; use @DEFAULT_MONITOR@ for the
+  #                       default sink's output, or a sink/source name)
+  #   $2  optional sink-input index to monitor a single app's playback level
+  # Capturing @DEFAULT_SOURCE@ reads POST-filter levels when RNNoise is on (i.e.
+  # what leaks through). Names itself "qs-mic-level" so the mic-users enumerator
+  # drops it (real-source captures would otherwise list themselves as a mic user
+  # / trip the in-use indicator; monitor captures are already skipped as
+  # monitors).
+  level-meter-sh = pkgs.writeShellScriptBin "audio-level-meter" ''
+    target="''${1:-@DEFAULT_SOURCE@}"
+    monidx="''${2:-}"
+    exec parec --rate=8000 --channels=1 --format=s16le --latency-msec=40 \
+      -d "$target" ''${monidx:+--monitor-stream="$monidx"} \
+      --client-name=qs-mic-level --stream-name=qs-mic-level 2>/dev/null \
+      | ${pkgs.perl}/bin/perl ${mic-level-pl}
+  '';
+
+  # ── Speech-activity meter (VAD variant of the level meter) ──────────────────
+  # Unlike level-meter-sh (raw peak loudness), this classifies whether each frame
+  # is *speech* using WebRTC VAD — a tiny C library built for real-time telephony,
+  # so it's cheap enough to run one instance per candidate mic continuously. It
+  # discriminates voice from steady non-speech noise (fans, keyboard, hum) that
+  # a pure energy meter can't, which is what the auto-switch selection needs:
+  # "which mic is hearing ME", not "which mic is loudest".
+  #
+  # Output: one line per ~60ms window — `speech snr level`
+  #   speech : 1 if the window is majority-voiced, else 0
+  #   snr    : dB of the loudest voiced frame above this mic's tracked noise floor
+  #            (the per-mic-comparable number — a near headset reads high, a far
+  #            desk mic reads low even at the same absolute loudness)
+  #   level  : 0..100 peak of voiced frames, dBFS-mapped over a -50dB floor (0
+  #            while not speaking), matching mic-level.pl's scale
+  # setuptools: webrtcvad does `import pkg_resources` at import time.
+  vad-python = pkgs.python3.withPackages (ps: [
+    ps.webrtcvad
+    ps.setuptools
+  ]);
+  vad-meter-py = pkgs.writeText "qs-vad-meter.py" ''
+    import sys, struct, math
+    import webrtcvad
+
+    RATE = 16000                 # WebRTC VAD supports 8/16/32/48k; 16k is the sweet spot
+    FRAME_MS = 20                # VAD requires 10/20/30ms frames
+    FRAME_SAMPLES = RATE * FRAME_MS // 1000
+    FRAME_BYTES = FRAME_SAMPLES * 2          # s16 mono
+    GROUP = 3                    # emit one line per GROUP frames (~60ms)
+    NF_ALPHA = 0.03              # noise-floor EWMA follow rate (per non-speech frame)
+    FLOOR_DB = -70.0             # dBFS that maps to level 0 — low enough that a dead
+                                 # (muted/unplugged) mic reads ~0 while a merely-quiet
+                                 # room still reads > 0 (so the daemon can tell them apart)
+
+    # Aggressiveness 0..3 — higher rejects more non-speech as silence. 2 is a good
+    # default for distinguishing voice from fan/keyboard without clipping speech.
+    agg = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+    vad = webrtcvad.Vad(agg)
+
+    # Noise floor in dBFS, tracked from non-speech frames only. Starts conservative
+    # so early SNR is sane before it settles to the mic's real floor.
+    noise_db = -60.0
+
+    def dbfs(frame):
+        n = len(frame) // 2
+        if n == 0:
+            return -90.0
+        samples = struct.unpack("<%dh" % n, frame)
+        acc = 0
+        for v in samples:
+            acc += v * v
+        rms = math.sqrt(acc / n)
+        if rms < 1.0:
+            return -90.0
+        return 20.0 * math.log10(rms / 32768.0)
+
+    buf = b""
+    voiced = 0
+    count = 0
+    peak_db = -90.0     # loudest VOICED frame this window (for snr)
+    win_peak = -90.0    # loudest frame of ANY kind this window (for level)
+
+    while True:
+        chunk = sys.stdin.buffer.read(FRAME_BYTES)
+        if not chunk:
+            break
+        buf += chunk
+        while len(buf) >= FRAME_BYTES:
+            frame = buf[:FRAME_BYTES]
+            buf = buf[FRAME_BYTES:]
+            try:
+                speech = vad.is_speech(frame, RATE)
+            except Exception:
+                speech = False
+            db = dbfs(frame)
+            if db > win_peak:
+                win_peak = db
+            if speech:
+                voiced += 1
+                if db > peak_db:
+                    peak_db = db
+            else:
+                noise_db = (1.0 - NF_ALPHA) * noise_db + NF_ALPHA * db
+            count += 1
+            if count >= GROUP:
+                is_speech = 1 if voiced * 2 >= count else 0
+                # level = the window's REAL loudness (any frame), reported always so
+                # the daemon can spot a dead/muted mic. snr stays voiced-only — the
+                # selection signal — and is 0 on non-speech windows as before.
+                level = (win_peak - FLOOR_DB) / (-FLOOR_DB) * 100.0
+                level = max(0.0, min(100.0, level))
+                snr = max(0.0, peak_db - noise_db) if is_speech else 0.0
+                sys.stdout.write("%d %d %d\n" % (is_speech, int(snr), int(level)))
+                sys.stdout.flush()
+                voiced = 0
+                count = 0
+                peak_db = -90.0
+                win_peak = -90.0
+  '';
+
+  # Streams speech-activity of a device as `speech snr level` per ~60ms. Mirrors
+  # level-meter-sh's parec wiring at 16kHz (VAD's native rate). Names itself
+  # "qs-vad" so the mic-users enumerator drops it (these taps read real mics and
+  # would otherwise each list as a mic user / trip the in-use indicator).
+  #   $1  parec device (default @DEFAULT_SOURCE@; pass a source name per mic)
+  #   $2  optional VAD aggressiveness 0..3 (default 2)
+  vad-meter-sh = pkgs.writeShellScriptBin "audio-vad-meter" ''
+    target="''${1:-@DEFAULT_SOURCE@}"
+    agg="''${2:-2}"
+    exec ${pkgs.pulseaudio}/bin/parec --rate=16000 --channels=1 --format=s16le --latency-msec=20 \
+      -d "$target" \
+      --client-name=qs-vad --stream-name=qs-vad 2>/dev/null \
+      | ${vad-python}/bin/python ${vad-meter-py} "$agg"
+  '';
+
+  # ── Auto-switch daemon ──────────────────────────────────────────────────────
+  # Watches a config file listing prioritised candidate mics. While auto-switch
+  # is enabled AND there are >=2 candidates, it runs one VAD meter per candidate
+  # and routes the active mic to whichever is currently *viable* (hearing real
+  # speech), preferring higher-priority mics. Crucially it switches ONLY when a
+  # candidate shows viable speech — never merely because the current mic went
+  # quiet — and holds the current mic when nothing is viable. With <2 candidates
+  # or disabled, it spawns nothing (no meters, ~1 stat/sec idle) so it costs
+  # nothing when no secondary mics are configured.
+  #
+  # Routing reuses the existing rnnoise plumbing: when the noise-cancel virtual
+  # source is the default (denoise on), it retargets capture.rnnoise_source for a
+  # seamless swap; otherwise (denoise off) it sets the default source directly.
+  # So auto-switch works whether or not denoising is on.
+  #
+  # Config: $XDG_CONFIG_HOME/auto-mic/config.json (auto-created, disabled):
+  #   { "enabled": true,
+  #     "candidates": ["alsa_input.usb-Blue...", "alsa_input.usb-SteelSeries..."],
+  #     "snr_min": 6, "viable_ms": 180, "grace_ms": 150, "hysteresis_ms": 350 }
+  # candidates are source node.names, highest priority first.
+  auto-mic-daemon-py = pkgs.writeText "auto-mic-daemon.py" ''
+    import json, os, signal, subprocess, threading, time
+
+    CONFIG = os.environ.get("AUTO_MIC_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "auto-mic", "config.json")
+    STATE  = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "auto-mic-active")
+    # Filter on/off, written by qs-rnnoise-toggle. The filter-chain boots ON.
+    FILTER_STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "qs-rnnoise-on")
+    VAD_METER = os.environ.get("AUTO_MIC_VAD_METER") or "qs-vad-meter"
+    SET_INPUT = os.environ.get("AUTO_MIC_SET_INPUT") or "qs-rnnoise-set-input"
+    RN_SOURCE = "rnnoise_source"
+    RN_CAP_PORT = "capture.rnnoise_source:input_MONO"   # the filter's mono input port
+
+    DEFAULTS = {
+        "enabled": False,
+        "candidates": [],      # source node.names, highest priority first
+        "snr_min": 6.0,        # dB above the mic's noise floor to count as hearing you at all
+        "near_snr": 10.0,      # dB that means you're CLOSE to a mic. We prefer the
+                               # highest-priority mic that hears you this clearly; we
+                               # leave it for a secondary once it drops below this
+                               # (you've walked away) — not at near-silence, so you
+                               # don't fade out before the handoff. Close speech ~20-26.
+        "stick_db": 2.0,       # the current mic stays "near" with this much lower a bar,
+                               # widening the boundary so it can't flap at the threshold
+        "viable_ms": 180,      # voicing must persist this long before a mic is viable
+        "grace_ms": 150,       # bridge VAD flicker: shorter gaps don't end a voice run
+        "hysteresis_ms": 200,  # higher-priority mic must hold this long before we switch UP
+                               # (kept short: "back to the priority mic ASAP")
+        "drop_ms": 700,        # walk-away condition must hold this long before falling DOWN
+                               # (long enough that a brief breath/blip into the close
+                               # headset mic while you're quiet won't trigger a switch)
+        "settle_ms": 400,      # lockout after any switch, so it can't bounce straight back
+        "dead_level": 4.0,     # window loudness (0..100) below this = no real signal
+        "dead_hold_ms": 150,   # ...sustained this long marks the current mic dead
+        "dead_cut_ms": 150,    # then cut away this fast (vs drop_ms for a walk-away),
+                               # for when a mic is muted/unplugged and another hears you
+        "vad_agg": 3,          # WebRTC VAD aggressiveness 0..3 (3 = reject non-speech hardest)
+        "crossfade": True,     # make-before-break linking so no audio is lost at a switch
+                               # (denoise-on path only; harmless to leave on)
+        "crossfade_ms": 120,   # overlap window where both mics feed the filter at once
+        "poll_ms": 50,         # selection tick while metering
+    }
+
+    def log(*a):
+        print("[auto-mic]", *a, flush=True)
+
+    def load_config():
+        cfg = dict(DEFAULTS)
+        try:
+            with open(CONFIG) as f:
+                user = json.load(f)
+            if isinstance(user, dict):
+                cfg.update(user)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log("config parse error, using defaults:", e)
+        return cfg
+
+    def ensure_config():
+        if os.path.exists(CONFIG):
+            return
+        try:
+            os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+            with open(CONFIG, "w") as f:
+                json.dump({"enabled": False, "candidates": []}, f, indent=2)
+            log("wrote default disabled config at", CONFIG)
+        except Exception as e:
+            log("could not write default config:", e)
+
+    def default_source():
+        try:
+            return subprocess.run(["pactl", "get-default-source"],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            return ""
+
+    def set_default(name):
+        try:
+            subprocess.run(["pactl", "set-default-source", name], timeout=5)
+        except Exception:
+            pass
+
+    def real_sources():
+        """Real (non-monitor, non-rnnoise) capture sources, by node.name."""
+        try:
+            out = subprocess.run(["pactl", "list", "short", "sources"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return []
+        names = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                n = parts[1]
+                if n != RN_SOURCE and not n.endswith(".monitor"):
+                    names.append(n)
+        return names
+
+    class Meter:
+        """One VAD meter subprocess per mic; a thread folds its `speech snr level`
+        lines into a live voice-run estimate."""
+        def __init__(self, mic, cfg, on_line):
+            self.mic = mic
+            self.grace_s = cfg["grace_ms"] / 1000.0
+            self.dead_level = cfg["dead_level"]
+            self.on_line = on_line   # called (event-driven) after each window
+            self.lock = threading.Lock()
+            self.snr = 0.0
+            self.level = 100.0       # last window loudness (0..100); ~0 = dead/muted
+            self.last_line = 0.0     # monotonic of the last meter line (any kind)
+            self.dead_since = None   # monotonic the level first went ~0, else None
+            self.last_voiced = 0.0   # monotonic of the last speech==1 window
+            self.voice_start = 0.0   # monotonic the current voice run began
+            self.snr_ewma = 0.0      # decaying RECENT snr (tracks you getting
+                                     # quieter mid-sentence as you walk away — a
+                                     # peak-hold would stay stuck at the loud start)
+            # New session so we can kill the whole parec|python pipeline cleanly.
+            self.proc = subprocess.Popen([VAD_METER, mic, str(cfg["vad_agg"])],
+                                         stdout=subprocess.PIPE,
+                                         text=True, start_new_session=True)
+            self.thread = threading.Thread(target=self._read, daemon=True)
+            self.thread.start()
+
+        def _read(self):
+            for line in self.proc.stdout:
+                parts = line.split()
+                if len(parts) != 3:
+                    continue
+                try:
+                    sp, snr, level = int(parts[0]), float(parts[1]), float(parts[2])
+                except ValueError:
+                    continue
+                now = time.monotonic()
+                with self.lock:
+                    # Track loudness on EVERY window (incl. non-speech) so we can
+                    # tell a dead/muted mic (level ~0) from a quiet room.
+                    self.level = level
+                    self.last_line = now
+                    if level < self.dead_level:
+                        if self.dead_since is None:
+                            self.dead_since = now
+                    else:
+                        self.dead_since = None
+                    if sp:
+                        if (now - self.last_voiced) > self.grace_s:
+                            self.voice_start = now      # start of a fresh voice run
+                            self.snr_ewma = snr
+                        else:
+                            self.snr_ewma = 0.5 * snr + 0.5 * self.snr_ewma
+                        self.last_voiced = now
+                        self.snr = snr
+                if sp:
+                    # Speech window -> re-evaluate selection (driven by the audio
+                    # stream, not a clock).
+                    try:
+                        self.on_line()
+                    except Exception:
+                        pass
+
+        def viable(self, now, snr_min, viable_ms):
+            with self.lock:
+                if (now - self.last_voiced) > self.grace_s:
+                    return False
+                if self.snr_ewma < snr_min:
+                    return False
+                return (now - self.voice_start) * 1000.0 >= viable_ms
+
+        # True if this mic has been producing essentially no signal (muted /
+        # unplugged / dead) for at least hold_ms — distinct from a merely quiet room.
+        def is_dead(self, now, hold_ms):
+            with self.lock:
+                if (now - self.last_line) > 0.5:     # meter stalled: can't tell
+                    return False
+                return (self.dead_since is not None
+                        and (now - self.dead_since) * 1000.0 >= hold_ms)
+
+        def stop(self):
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
+
+    class Controller:
+        def __init__(self):
+            self.cfg = load_config()
+            self.meters = {}        # mic -> Meter (only while auto-switching)
+            self.active_mic = None  # real mic currently feeding the filter
+            self.pending = None
+            self.pending_since = 0.0
+            self.last_switch = 0.0
+            self.lock = threading.RLock()
+            self.reload = threading.Event()   # set by SIGHUP (config / filter change)
+
+        # ── state ────────────────────────────────────────────────────────
+        def filter_on(self):
+            try:
+                with open(FILTER_STATE) as f:
+                    return f.read().strip() != "off"
+            except Exception:
+                return True               # the filter-chain boots ON
+        def auto_on(self):
+            return bool(self.cfg.get("enabled"))
+        def system_active(self):
+            # We pin rnnoise_source as the default and manage routing whenever
+            # EITHER the filter or auto-switch is on. With BOTH off we step aside
+            # entirely so the menu drives real devices directly (escape hatch).
+            return self.auto_on() or self.filter_on()
+        def _candidates(self):
+            return self.cfg.get("candidates") or []
+
+        def ensure_default_rnnoise(self):
+            if default_source() != RN_SOURCE:
+                set_default(RN_SOURCE)
+
+        def _set_active(self, mic):
+            self.active_mic = mic
+            try:
+                with open(STATE, "w") as f:
+                    f.write((mic or "") + "\n")
+            except Exception:
+                pass
+
+        # One VAD meter per candidate, but ONLY while auto-switching is on.
+        def _sync_meters(self):
+            want = (set(self._candidates())
+                    if (self.auto_on() and len(self._candidates()) >= 2) else set())
+            for mic in list(self.meters):
+                if mic not in want:
+                    self.meters.pop(mic).stop()
+            for mic in want:
+                if mic not in self.meters:
+                    self.meters[mic] = Meter(mic, self.cfg, self.on_meter_update)
+
+        def route(self, mic):
+            # Always send the chosen mic THROUGH the filter (make-before-break
+            # crossfade); never swap the default to a raw device.
+            try:
+                if self.cfg.get("crossfade", True):
+                    self._crossfade_to(mic)
+                else:
+                    subprocess.run([SET_INPUT, mic], timeout=5)
+            except Exception as e:
+                log("route failed:", e)
+            self._set_active(mic)
+
+        # Make-before-break: link the new mic into the rnnoise capture BEFORE
+        # dropping the old one, so the stream never goes silent (a hard retarget
+        # leaves a gap that clips words mid-sentence). Both mics feed the filter
+        # for crossfade_ms — a brief, unnoticeable overlap, far better than a gap.
+        def _crossfade_to(self, mic):
+            newport = self._first_out_port(mic)
+            if not newport:
+                subprocess.run([SET_INPUT, mic], timeout=5)   # fallback: hard retarget
+                return
+            # 1. make: add the new link while the old one is still carrying audio.
+            subprocess.run(["pw-link", newport, RN_CAP_PORT], timeout=5,
+                           stderr=subprocess.DEVNULL)
+            # 2. overlap so there is never a silent moment.
+            time.sleep(self.cfg.get("crossfade_ms", 120) / 1000.0)
+            # 3. point the filter's metadata at the new mic so WirePlumber won't
+            #    re-create the old link, and the UI resolves the right device.
+            subprocess.run([SET_INPUT, mic], timeout=5)
+            # 4. break: drop every other source still feeding the capture.
+            for srcport in self._links_into(RN_CAP_PORT):
+                if srcport != newport:
+                    subprocess.run(["pw-link", "-d", srcport, RN_CAP_PORT],
+                                   timeout=5, stderr=subprocess.DEVNULL)
+
+        # The first output (capture) port of a source node, e.g.
+        # "alsa_input.…Yeti…:capture_AUX0" or "…Arctis…:capture_MONO".
+        def _first_out_port(self, mic):
+            try:
+                out = subprocess.run(["pw-link", "-o"], capture_output=True,
+                                     text=True, timeout=5).stdout
+            except Exception:
+                return None
+            pref = mic + ":"
+            for line in out.splitlines():
+                s = line.strip()
+                if s.startswith(pref):
+                    return s
+            return None
+
+        # Source ports currently linked into the given input port.
+        def _links_into(self, port):
+            try:
+                out = subprocess.run(["pw-link", "-l"], capture_output=True,
+                                     text=True, timeout=5).stdout
+            except Exception:
+                return []
+            res = []
+            inblock = False
+            for line in out.splitlines():
+                if line[:1] not in (" ", "\t"):
+                    inblock = (line.strip() == port)
+                    continue
+                if inblock and "|<-" in line:
+                    res.append(line.split("|<-", 1)[1].strip())
+            return res
+
+        # Node name of the mic currently feeding the filter (or None).
+        def _current_feed(self):
+            for srcport in self._links_into(RN_CAP_PORT):
+                return srcport.rsplit(":", 1)[0]
+            return None
+
+        # ── selection — runs on each VAD window (driven by the audio stream) ──
+        def on_meter_update(self):
+            if not self.auto_on():
+                return
+            with self.lock:
+                self._select()
+
+        def _select(self):
+            now = time.monotonic()
+            cfg = self.cfg
+            cands = self._candidates()
+
+            def is_viable(m, snr):
+                return (m in self.meters
+                        and self.meters[m].viable(now, snr, cfg["viable_ms"]))
+
+            # "near" = you're CLOSE to a mic; the current one gets a lower bar
+            # (stick_db) so it can't flap at the threshold.
+            def is_near(m):
+                bar = cfg["near_snr"] - (cfg["stick_db"] if m == self.active_mic else 0.0)
+                return is_viable(m, bar)
+
+            # Prefer the highest-priority mic you're close to; hand off as soon as
+            # it drops below near_snr (walked away) while still audible. Fall back
+            # to any mic that hears you so you stay live.
+            desired = next((m for m in cands if is_near(m)), None)
+            if desired is None:
+                desired = next((m for m in cands if is_viable(m, cfg["snr_min"])), None)
+            if desired is None or desired == self.active_mic:
+                self.pending = None
+                return
+
+            ai = cands.index(self.active_mic) if self.active_mic in cands else len(cands)
+            di = cands.index(desired)
+            threshold = cfg["hysteresis_ms"] if di < ai else cfg["drop_ms"]
+            # If the current mic has gone entirely dead (muted/unplugged) while
+            # another is hearing you, cut across fast instead of waiting out the
+            # normal walk-away delay.
+            if (self.active_mic in self.meters
+                    and self.meters[self.active_mic].is_dead(now, cfg["dead_hold_ms"])):
+                threshold = cfg["dead_cut_ms"]
+            if (now - self.last_switch) * 1000.0 < cfg["settle_ms"]:
+                return
+            if self.pending != desired:
+                self.pending = desired
+                self.pending_since = now
+            elif (now - self.pending_since) * 1000.0 >= threshold:
+                self.ensure_default_rnnoise()
+                self.route(desired)
+                self.pending = None
+                self.last_switch = now
+                log("switch ->", desired)
+
+        # ── state machine — run on start, on SIGHUP, on default-change ────
+        def apply_state(self):
+            with self.lock:
+                self.cfg = load_config()
+                if self.system_active():
+                    # Carry the real mic we were on into the filter input, then pin
+                    # rnnoise_source as the one default everything lives behind.
+                    d = default_source()
+                    if d and d != RN_SOURCE and d in real_sources():
+                        subprocess.run([SET_INPUT, d], timeout=5)
+                    self.ensure_default_rnnoise()
+                    self._sync_meters()
+                    feed = self._current_feed()
+                    if not self.auto_on():
+                        self._set_active(feed)
+                    elif self.active_mic not in self._candidates():
+                        self._set_active(feed if feed in self._candidates()
+                                         else (self._candidates()[0] if self._candidates() else None))
+                else:
+                    # Both off: step aside — drop meters, hand the default back to a
+                    # real device so the menu drives hardware directly.
+                    self._sync_meters()           # auto off -> clears all meters
+                    feed = self._current_feed()
+                    if feed and feed in real_sources():
+                        set_default(feed)
+                    self.pending = None
+                    self._set_active(None)
+                log("state: active=%s auto=%s filter=%s mic=%s"
+                    % (self.system_active(), self.auto_on(), self.filter_on(), self.active_mic))
+
+        # ── default-change events (pactl subscribe; no clock polling) ─────
+        def watch_default(self):
+            try:
+                proc = subprocess.Popen(["pactl", "subscribe"],
+                                        stdout=subprocess.PIPE, text=True)
+            except Exception as e:
+                log("subscribe failed:", e)
+                return
+            for line in proc.stdout:
+                if "on server" in line:          # default sink/source changed
+                    with self.lock:
+                        if self.system_active():
+                            self.ensure_default_rnnoise()
+
+        def reload_loop(self):
+            while True:
+                self.reload.wait()
+                self.reload.clear()
+                self.apply_state()
+
+        def run(self):
+            ensure_config()
+            log("started; config", CONFIG)
+            self.apply_state()
+            threading.Thread(target=self.reload_loop, daemon=True).start()
+            self.watch_default()                 # blocks main thread; event-driven
+
+    def main():
+        ctrl = Controller()
+        # SIGHUP from the UI (config or filter toggle changed) -> re-evaluate.
+        signal.signal(signal.SIGHUP, lambda *_: ctrl.reload.set())
+        ctrl.run()
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except KeyboardInterrupt:
+            pass
+  '';
+
+  auto-mic-daemon-sh = pkgs.writeShellScriptBin "audio-auto-mic-daemon" ''
+    export PATH="${pkgs.pulseaudio}/bin:${pkgs.pipewire}/bin:$PATH"
+    export AUTO_MIC_VAD_METER="${vad-meter-sh}/bin/audio-vad-meter"
+    export AUTO_MIC_SET_INPUT="${rnnoise-set-input-sh}/bin/audio-rnnoise-set-input"
+    exec ${pkgs.python3}/bin/python ${auto-mic-daemon-py}
+  '';
+
+  # ── Auto-switch UI: read + mutate the daemon's config ───────────────────────
+  # The quickshell input picker uses these to show candidate state and to edit
+  # it (toggle a mic into the set, reorder priority, flip the master switch).
+  # Same config file the daemon watches, so edits apply live.
+  auto-mic-config-path = ''"''${XDG_CONFIG_HOME:-$HOME/.config}/auto-mic/config.json"'';
+
+  # Emits the current auto-switch state as parseable lines:
+  #   enabled|<0|1>
+  #   cand|<priorityIndex>|<source node.name>   (one per candidate, in order)
+  #   active|<source node.name>                  (the mic the daemon is live on)
+  auto-mic-read-sh = pkgs.writeShellScriptBin "audio-auto-mic-read" ''
+    cfg=${auto-mic-config-path}
+    state="''${XDG_RUNTIME_DIR:-/tmp}/auto-mic-active"
+    if [ -f "$cfg" ]; then
+      ${pkgs.jq}/bin/jq -r '
+        "enabled|" + (if .enabled then "1" else "0" end),
+        ((.candidates // []) | to_entries[] | "cand|\(.key)|\(.value)")
+      ' "$cfg" 2>/dev/null || echo "enabled|0"
+    else
+      echo "enabled|0"
+    fi
+    [ -f "$state" ] && echo "active|$(cat "$state")"
+    exit 0
+  '';
+
+  # Mutate the config. Subcommands:
+  #   toggle-enabled            flip the master auto-switch on/off
+  #   set-enabled <1|0>         force the master auto-switch on/off
+  #   toggle <source.name>      add the mic to the candidate set, or remove it
+  #   up|down <source.name>     move the mic earlier/later in priority
+  auto-mic-mutate-sh = pkgs.writeShellScriptBin "audio-auto-mic-mutate" ''
+    cfg=${auto-mic-config-path}
+    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$cfg")"
+    [ -f "$cfg" ] || echo '{"enabled":false,"candidates":[]}' > "$cfg"
+    cmd="$1"; name="$2"
+    jq=${pkgs.jq}/bin/jq
+    tmp=$(${pkgs.coreutils}/bin/mktemp)
+    case "$cmd" in
+      toggle-enabled)
+        "$jq" '.enabled = ((.enabled // false) | not)' "$cfg" > "$tmp" ;;
+      set-enabled)
+        # $name is "1" or "0" — used by the MIX toggle to force auto off
+        # (blend and auto-switch are mutually exclusive routing modes).
+        "$jq" --argjson v "$([ "$name" = "1" ] && echo true || echo false)" \
+          '.enabled = $v' "$cfg" > "$tmp" ;;
+      toggle)
+        "$jq" --arg n "$name" '
+          .candidates = (.candidates // []) |
+          if (.candidates | index($n)) then .candidates -= [$n]
+          else .candidates += [$n] end' "$cfg" > "$tmp" ;;
+      up)
+        "$jq" --arg n "$name" '
+          .candidates = (.candidates // []) |
+          (.candidates | index($n)) as $i |
+          if ($i == null or $i == 0) then .
+          else .candidates = (.candidates[0:$i-1] + [.candidates[$i]] + [.candidates[$i-1]] + .candidates[$i+1:]) end
+        ' "$cfg" > "$tmp" ;;
+      down)
+        "$jq" --arg n "$name" '
+          .candidates = (.candidates // []) |
+          (.candidates | index($n)) as $i | (.candidates | length) as $len |
+          if ($i == null or $i >= $len - 1) then .
+          else .candidates = (.candidates[0:$i] + [.candidates[$i+1]] + [.candidates[$i]] + .candidates[$i+2:]) end
+        ' "$cfg" > "$tmp" ;;
+      *) ${pkgs.coreutils}/bin/rm -f "$tmp"; echo "unknown command: $cmd" >&2; exit 1 ;;
+    esac
+    if [ -s "$tmp" ]; then ${pkgs.coreutils}/bin/mv "$tmp" "$cfg"; else ${pkgs.coreutils}/bin/rm -f "$tmp"; fi
+    # Nudge the daemon to re-read config + re-evaluate (event-driven, no polling).
+    ${pkgs.procps}/bin/pkill -HUP -f auto-mic-daemon.py 2>/dev/null || true
+    echo done
+  '';
+
+  list-sink-inputs-sh = pkgs.writeShellScriptBin "audio-list-sink-inputs" ''
+    titlesfile=$(mktemp)
+    namesfile=$(mktemp)
+    trap "rm -f $titlesfile $namesfile" EXIT
+
+    hyprctl clients -j 2>/dev/null \
+      | ${pkgs.jq}/bin/jq -r '.[] | [(.pid|tostring), .title] | join("\u0001")' \
+      > "$titlesfile" 2>/dev/null || true
+
+    # Walk up the process tree to find the root electron/chromium ancestor
+    # and identify the real application from its cmdline
+    resolve_electron() {
+      local pid=$1 current=$pid last=$pid ppid exe
+      while true; do
+        ppid=$(awk '/^PPid:/{print $2}' /proc/$current/status 2>/dev/null)
+        [ -z "$ppid" ] || [ "$ppid" = "1" ] || [ "$ppid" = "0" ] && break
+        exe=$(readlink /proc/$ppid/exe 2>/dev/null)
+        case "$exe" in
+          *electron*|*chromium*) last=$ppid; current=$ppid ;;
+          *) break ;;
+        esac
+      done
+      local cmdline
+      cmdline=$(tr '\0' ' ' < /proc/$last/cmdline 2>/dev/null)
+      case "$cmdline" in
+        *[Vv]esktop*)  echo "Vesktop" ;;
+        *[Dd]iscord*)  echo "Discord" ;;
+        *[Ss]lack*)    echo "Slack" ;;
+        *[Oo]bsidian*) echo "Obsidian" ;;
+        *)
+          # Extract app name from nix store path: /nix/store/hash-appname-version/
+          echo "$cmdline" \
+            | sed -n 's|.*/nix/store/[^/]*/\([^/ ]*\).*|\1|p' \
+            | head -1 \
+            | sed 's/-[0-9].*//'
+          ;;
+      esac
+    }
+
+    # Pre-compute names for electron-based sink input PIDs
+    pactl list sink-inputs \
+      | awk '/application\.process\.id/{split($0,a,"\""); print a[2]}' \
+      | sort -u \
+      | while read -r pid; do
+          [ -z "$pid" ] && continue
+          exe=$(readlink /proc/$pid/exe 2>/dev/null)
+          case "$exe" in
+            *electron*|*chromium*)
+              name=$(resolve_electron "$pid")
+              [ -n "$name" ] && printf '%s\001%s\n' "$pid" "$name"
+              ;;
+          esac
+        done > "$namesfile"
+
+    pactl list sink-inputs | awk -v tf="$titlesfile" -v nf="$namesfile" '
+      BEGIN {
+        while ((getline line < tf) > 0) {
+          idx = index(line, "\001")
+          if (idx > 0) titles[substr(line,1,idx-1)] = substr(line,idx+1)
+        }
+        close(tf)
+        while ((getline line < nf) > 0) {
+          idx = index(line, "\001")
+          if (idx > 0) enames[substr(line,1,idx-1)] = substr(line,idx+1)
+        }
+        close(nf)
+      }
+      # The output duplicator per-sink playback streams (from the combine
+      # sink the MIX toggle loads on demand) are not apps — they get their
+      # own rows in the dup-sink mixer of the popup instead.
+      function emit() {
+        if (id == "" || nodename ~ /^output\.combined_out/) return
+        title = (pid in titles) ? titles[pid] : ""
+        if (pid in enames) name = enames[pid]
+        printf "%s|%s|%s|%s|%s|%s\n", id, name, vol, muted, binary, title
+      }
+      /^Sink Input #/ {
+        emit()
+        id = substr($3, 2); name = "Unknown"; vol = 100; muted = 0; binary = ""; pid = ""; nodename = ""
+      }
+      /Mute:/      { muted = ($2 == "yes") ? 1 : 0 }
+      /Volume:.*%/ { match($0, /[0-9]+%/); if (RSTART > 0) vol = substr($0, RSTART, RLENGTH-1) + 0 }
+      /application\.name/            { split($0, a, "\""); if (length(a) > 1) name   = a[2] }
+      /application\.process\.binary/ { split($0, a, "\""); if (length(a) > 1) binary = a[2] }
+      /application\.process\.id/     { split($0, a, "\""); if (length(a) > 1) pid    = a[2] }
+      /node\.name = /                { split($0, a, "\""); if (length(a) > 1) nodename = a[2] }
+      END { emit() }
+    '
+  '';
+
+
+  # Print the display name (from audio-naming-awk) of the current default
+  # sink or source. Used by the bar; replaces the older getDefaultSink/
+  # getDefaultSource scripts so naming stays consistent.
+  #   Usage: default-display-name-sh <sink|source> [short]
+  # Without "short": full display_name() like "Built In (Ryzen HD Audio)".
+  # With "short":    short_name() — just the label or first 3 words of desc.
+  default-display-name-sh = pkgs.writeShellScriptBin "audio-default-display-name" ''
+    kind="$1"   # "sink" or "source"
+    mode="''${2:-full}"
+    default=$(pactl get-default-"$kind" 2>/dev/null)
+    [ -z "$default" ] && exit 0
+    # With noise cancellation on the default source is the virtual rnnoise_source
+    # ("Noise Canceling Source"). Show the real hardware mic behind it instead.
+    if [ "$kind" = "source" ] && [ "$default" = "rnnoise_source" ]; then
+      fin=$(${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input)
+      [ -n "$fin" ] && default="$fin"
+    fi
+    pactl list "''${kind}s" | awk -v target="$default" -v mode="$mode" '
+      ${audio-naming-awk}
+      function emit() {
+        if (mode == "short") print short_name(port, alsa_card, alsa_device, desc)
+        else                 print display_name(port, alsa_card, alsa_device, desc)
+      }
+      /^(Sink|Source) #/ {
+        if (name == target) { emit(); name = ""; exit }
+        name = ""; desc = ""; port = ""; alsa_card = ""; alsa_device = ""
+      }
+      /^\tName:/        { name = $2 }
+      /^\tDescription:/ { desc = substr($0, index($0, $2)) }
+      /^\tActive Port:/ { port = $3 }
+      /alsa\.card = /   { match($0, /"[^"]*"/); alsa_card   = substr($0, RSTART+1, RLENGTH-2) }
+      /alsa\.device = / { match($0, /"[^"]*"/); alsa_device = substr($0, RSTART+1, RLENGTH-2) }
+      END { if (name == target) emit() }
+    '
+  '';
+  tools = [
+    bt-audio-connect-sh
+    list-sinks-sh
+    list-sources-sh
+    list-sink-inputs-sh
+    list-dup-sinks-sh
+    list-blend-mics-sh
+    default-display-name-sh
+    rnnoise-current-input-sh
+    rnnoise-set-input-sh
+    rnnoise-set-filter-sh
+    rnnoise-toggle-sh
+    rnnoise-status-sh
+    micblend-status-sh
+    micblend-set-sh
+    micblend-toggle-sh
+    outdup-status-sh
+    outdup-toggle-sh
+    usb-headroom-set-sh
+    usb-headroom-status-sh
+    audio-xrun-guard-sh
+    xrun-guard-status-sh
+    xrun-guard-toggle-sh
+    mic-inuse-sh
+    mic-users-sh
+    level-meter-sh
+    vad-meter-sh
+    auto-mic-daemon-sh
+    auto-mic-read-sh
+    auto-mic-mutate-sh
+  ];
+
+  # Human-facing dispatcher: `audioctl rnnoise-toggle`, `audioctl list-sinks`,
+  # `audioctl headroom-set 512`... Every subcommand is also directly on PATH
+  # as `audio-<subcommand>`.
+  audioctl = pkgs.writeShellScriptBin "audioctl" ''
+    if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "help" ]; then
+      echo "usage: audioctl <command> [args]"
+      echo "commands:"
+      IFS=: read -ra dirs <<< "$PATH"
+      for d in "''${dirs[@]}"; do
+        [ -d "$d" ] && ls "$d" 2>/dev/null
+      done | sed -n 's/^audio-/  /p' | sort -u
+      exit 0
+    fi
+    cmd="audio-$1"; shift
+    exec "$cmd" "$@"
+  '';
+in
+rec {
+  # Individual script derivations, for wiring into services etc.
+  inherit
+    audio-xrun-guard-sh
+    auto-mic-daemon-sh
+    ;
+
+  # Everything on PATH: audio-* tools + the audioctl dispatcher.
+  audio-tools = pkgs.symlinkJoin {
+    name = "audio-tools";
+    paths = tools ++ [ audioctl ];
+  };
+}
