@@ -625,6 +625,25 @@ let
       esac
     }
 
+    # "yes" if $1 is the replay-buffer screen recorder's own mic capture. Proven
+    # by the systemd-assigned cgroup AND the real executable behind the pid —
+    # NEITHER of which a process can forge — rather than the stream's self-
+    # reported name/pid. So an app can't dodge the indicator by calling itself
+    # "gpu-screen-recorder"; it would need to actually BE the recorder running
+    # inside the replay-buffer service.
+    is_replay_gsr() {
+      p="$1"
+      [ -n "$p" ] || return 1
+      case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
+        *gpu-screen-recorder*) ;;
+        *) return 1 ;;
+      esac
+      case "$(cat "/proc/$p/cgroup" 2>/dev/null)" in
+        *replay-buffer.service*) return 0 ;;
+      esac
+      return 1
+    }
+
     {
       # ── PipeWire capture streams ───────────────────────────────────────────
       pactl list source-outputs 2>/dev/null | awk -v SEP="$SEP" '
@@ -657,6 +676,15 @@ let
         # match because PipeWire may uniquify duplicate stream node names.
         case "$nodename" in capture.combined_mics*)
           [ "$client" = "n/a" ] && continue ;;
+        esac
+        # The screen recorder's always-on mic capture (replay buffer). It is
+        # always listening by design, so it shouldn't read as an app actively
+        # using the mic — but only skip it when it's PROVABLY the real recorder
+        # (cgroup + exe), so nothing can hide behind its name. gsr names its mic
+        # node "gsr-default_input"; its default_output capture is a monitor and
+        # is already dropped by is_monitor above.
+        case "$nodename" in gsr-*)
+          is_replay_gsr "$pid" && continue ;;
         esac
         exe=""
         [ -n "$pid" ] && exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
@@ -1484,7 +1512,6 @@ let
       END { emit() }
     '
   '';
-
 
   # Print the display name (from audio-naming-awk) of the current default
   # sink or source. Used by the bar; replaces the older getDefaultSink/
