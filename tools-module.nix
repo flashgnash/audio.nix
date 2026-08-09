@@ -42,13 +42,23 @@ in
     # at ~/.config/auto-mic/config.json enables it with >=2 candidate mics.
     systemd.user.services.auto-mic = {
       description = "Automatic microphone switcher (VAD-driven)";
-      after = [ "graphical-session.target" ];
+      after = [
+        "graphical-session.target"
+        "pipewire.service"
+        "wireplumber.service"
+        "pipewire-pulse.service"
+      ];
       partOf = [ "graphical-session.target" ];
       wantedBy = [ "graphical-session.target" ];
+      # If pipewire-pulse isn't up yet, `pactl subscribe` fails and the daemon
+      # exits CLEANLY (code 0) — on-failure would leave auto-switch dead for
+      # the whole session, so restart unconditionally and never hit the start
+      # limit.
+      unitConfig.StartLimitIntervalSec = 0;
       serviceConfig = {
         ExecStart = "${tools.auto-mic-daemon-sh}/bin/audio-auto-mic-daemon";
-        Restart = "on-failure";
-        RestartSec = "2s";
+        Restart = "always";
+        RestartSec = "3s";
       };
     };
   };

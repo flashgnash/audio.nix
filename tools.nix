@@ -943,6 +943,9 @@ let
                                # (long enough that a brief breath/blip into the close
                                # headset mic while you're quiet won't trigger a switch)
         "settle_ms": 400,      # lockout after any switch, so it can't bounce straight back
+        "flap_window_ms": 4000, # switching BACK to a mic we left this recently is a flap...
+        "flap_hold_ms": 1500,  # ...and must hold this long first, so borderline SNR at the
+                               # near_snr boundary can't ping-pong between two live mics
         "dead_level": 4.0,     # window loudness (0..100) below this = no real signal
         "dead_hold_ms": 150,   # ...sustained this long marks the current mic dead
         "dead_cut_ms": 150,    # then cut away this fast (vs drop_ms for a walk-away),
@@ -1105,6 +1108,8 @@ let
             self.pending = None
             self.pending_since = 0.0
             self.last_switch = 0.0
+            self.left_at = {}       # mic -> monotonic when we last switched AWAY from it
+            self.verify_at = 0.0    # last belief-vs-reality feed check
             self.lock = threading.RLock()
             self.reload = threading.Event()   # set by SIGHUP (config / filter change)
 
@@ -1249,16 +1254,40 @@ let
             desired = next((m for m in cands if is_near(m)), None)
             if desired is None:
                 desired = next((m for m in cands if is_viable(m, cfg["snr_min"])), None)
-            if desired is None or desired == self.active_mic:
+            if desired is None:
                 self.pending = None
+                return
+            if desired == self.active_mic:
+                self.pending = None
+                # Belief-vs-reality check: WirePlumber can re-link the filter
+                # behind our back (boot race, device hotplug), leaving us
+                # convinced the desired mic is live while another — possibly
+                # muted — one actually feeds the capture. Rate-limited so the
+                # pw-link exec cost stays negligible; still event-driven (only
+                # runs on speech windows).
+                if (now - self.verify_at) >= 2.0:
+                    self.verify_at = now
+                    if self._current_feed() != desired:
+                        self.ensure_default_rnnoise()
+                        self.route(desired)
+                        self.last_switch = now
+                        log("re-route (feed drifted) ->", desired)
                 return
 
             ai = cands.index(self.active_mic) if self.active_mic in cands else len(cands)
             di = cands.index(desired)
             threshold = cfg["hysteresis_ms"] if di < ai else cfg["drop_ms"]
+            # Anti-flap: switching BACK to a mic we only just left needs a much
+            # longer hold — with two live mics at borderline distance the near
+            # test oscillates around near_snr, and without this the daemon
+            # ping-pongs between them every settle window.
+            left = self.left_at.get(desired)
+            if left is not None and (now - left) * 1000.0 < cfg["flap_window_ms"]:
+                threshold = max(threshold, cfg["flap_hold_ms"])
             # If the current mic has gone entirely dead (muted/unplugged) while
             # another is hearing you, cut across fast instead of waiting out the
-            # normal walk-away delay.
+            # normal walk-away delay (overrides the flap hold: a dead mic means
+            # silence, so getting audible again beats damping the ping-pong).
             if (self.active_mic in self.meters
                     and self.meters[self.active_mic].is_dead(now, cfg["dead_hold_ms"])):
                 threshold = cfg["dead_cut_ms"]
@@ -1269,6 +1298,8 @@ let
                 self.pending_since = now
             elif (now - self.pending_since) * 1000.0 >= threshold:
                 self.ensure_default_rnnoise()
+                if self.active_mic:
+                    self.left_at[self.active_mic] = now
                 self.route(desired)
                 self.pending = None
                 self.last_switch = now
@@ -1289,9 +1320,21 @@ let
                     feed = self._current_feed()
                     if not self.auto_on():
                         self._set_active(feed)
-                    elif self.active_mic not in self._candidates():
-                        self._set_active(feed if feed in self._candidates()
-                                         else (self._candidates()[0] if self._candidates() else None))
+                    else:
+                        cands = self._candidates()
+                        target = (self.active_mic if self.active_mic in cands
+                                  else feed if feed in cands
+                                  else (cands[0] if cands else None))
+                        # Enforce, don't just record: at boot the filter's links
+                        # may not exist yet (feed None) and WirePlumber can later
+                        # restore them to a different mic than the one we picked.
+                        # Routing here makes belief and reality match on every
+                        # start/SIGHUP; the feed-drift check in _select self-heals
+                        # any later divergence.
+                        if target and feed != target:
+                            self.route(target)
+                        else:
+                            self._set_active(target)
                 else:
                     # Both off: step aside — drop meters, hand the default back to a
                     # real device so the menu drives hardware directly.
