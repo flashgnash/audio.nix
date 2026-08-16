@@ -23,7 +23,10 @@ pipewire-screenaudio:
     # Make the RNNoise LADSPA plugin discoverable via PipeWire's LADSPA_PATH.
     # The filter-chain below references it by basename (`librnnoise_ladspa`),
     # which PipeWire resolves through this path — absolute paths are NOT honored.
-    extraLadspaPackages = [ pkgs.rnnoise-plugin.ladspa ];
+    extraLadspaPackages = [
+      pkgs.rnnoise-plugin.ladspa
+      pkgs.ladspaPlugins # swh collection — sc4m compressor for the AGC stage
+    ];
 
     # RNNoise mic denoiser. Exposes ONE virtual source `rnnoise_source` that the
     # whole audio stack lives behind, fed either by one selected mic or by the
@@ -118,6 +121,20 @@ pipewire-screenaudio:
             "filter.graph" = {
               nodes = [
                 {
+                  # High-pass before everything: PC-fan rumble/hum sits below
+                  # ~150 Hz where RNNoise is weakest, and a spin-up's shifting
+                  # pitch defeats its steady-noise tracking (audible buzz).
+                  # 100 Hz shaves the fan band while leaving voice fundamentals
+                  # (~85 Hz+) essentially intact.
+                  type = "builtin";
+                  label = "bq_highpass";
+                  name = "hpf";
+                  control = {
+                    # 100 → 140 (2026-08-16): spin-ups still audible at 100.
+                    "Freq" = 140.0;
+                  };
+                }
+                {
                   type = "builtin";
                   label = "copy";
                   name = "split";
@@ -157,14 +174,39 @@ pipewire-screenaudio:
                     "Gain 2" = 1.0;
                   };
                 }
+                {
+                  # AGC: a slow leveling compressor (SC4 mono, swh) evens out
+                  # near/far mic distance. Post-mix so it applies with the
+                  # denoiser on OR bypassed; post-rnnoise so its makeup gain
+                  # boosts cleaned speech, not the noise floor. Close speech
+                  # (~-10 dBFS) and far speech (~-30 dBFS) land within ~3 dB
+                  # of each other instead of 20.
+                  type = "ladspa";
+                  name = "agc";
+                  plugin = "sc4m_1916";
+                  label = "sc4m";
+                  control = {
+                    "RMS/peak" = 0.0; # RMS sensing — smooth, no pumping
+                    "Attack time (ms)" = 15.0;
+                    "Release time (ms)" = 500.0;
+                    # -30/+12 → -26/+8 (2026-08-16): full boost on very soft
+                    # speech lifted the residual fan under it into audibility.
+                    "Threshold level (dB)" = -26.0;
+                    "Ratio (1:n)" = 8.0;
+                    "Knee radius (dB)" = 10.0;
+                    "Makeup gain (dB)" = 8.0;
+                  };
+                }
               ];
               links = [
+                { output = "hpf:Out"; input = "split:In"; }
                 { output = "split:Out"; input = "rnnoise:Input"; }
                 { output = "split:Out"; input = "mix:In 1"; }
                 { output = "rnnoise:Output"; input = "mix:In 2"; }
+                { output = "mix:Out"; input = "agc:Input"; }
               ];
-              inputs = [ "split:In" ];
-              outputs = [ "mix:Out" ];
+              inputs = [ "hpf:In" ];
+              outputs = [ "agc:Output" ];
             };
             "capture.props" = {
               "node.name" = "capture.rnnoise_source";
