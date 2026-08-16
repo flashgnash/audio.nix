@@ -121,6 +121,19 @@ let
   # filter isn't present. Used wherever rnnoise_source needs to resolve to the
   # real device behind it (device list, bar label, toggle-off restore).
   rnnoise-current-input-sh = pkgs.writeShellScriptBin "audio-rnnoise-current-input" ''
+    # INTENT first: the target.object metadata set by audio-rnnoise-set-input.
+    # Reading the first live link instead (old behaviour) is link-order
+    # roulette whenever a stray second link exists — it made micblend-status
+    # and the mix stand-down logic flap between answers.
+    capid=$(${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+      | ${pkgs.jq}/bin/jq -r '.[] | select(.info.props["node.name"] == "capture.rnnoise_source") | .id' \
+      | head -1)
+    if [ -n "$capid" ]; then
+      t=$(${pkgs.pipewire}/bin/pw-metadata "$capid" target.object 2>/dev/null \
+        | awk -F"'" "/key:'target.object'/ { print \$4; exit }")
+      [ -n "$t" ] && { echo "$t"; exit 0; }
+    fi
+    # Fallback (no metadata yet, e.g. fresh boot): first live link.
     ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | awk '
       /^capture\.rnnoise_source:input/ { f = 1; next }
       f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); sub(/:[^:]*$/, "", s); print s; exit }
@@ -141,9 +154,17 @@ let
       ${audio-naming-awk}
       function emit(    bt, cur) {
         if (name == "" || name ~ /\.monitor$/ || name == "rnnoise_source" || name == "combined_mics") return
+        # our own virtual plumbing: audio-mix-sync delay wrappers (delayed.<mic>
+        # + any bare pw-loopback nodes) and the snd_aloop loopback device
+        # ("Loopback Analog Stereo", guest-gaming plumbing) are internal,
+        # never user-selectable
+        if (name ~ /^delayed\./ || name ~ /^pw-loopback/) return
+        if (name ~ /platform-snd_aloop/) return
         bt  = (name ~ /^bluez_/) ? 1 : 0
         cur = (name == def) ? "1" : "0"
-        printf "%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt
+        # 5th field: bar-style short name, for the per-mic bar widgets
+        printf "%s|%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt,
+               short_name(port, alsa_card, alsa_device, desc)
       }
       /^Source #/ { emit()
                     name = ""; desc = ""; port = ""; alsa_card = ""; alsa_device = "" }
@@ -271,6 +292,22 @@ let
       | ${pkgs.jq}/bin/jq -r '.[] | select(.info.props["node.name"] == "capture.rnnoise_source") | .id' \
       | head -1)
     [ -n "$capid" ] && ${pkgs.pipewire}/bin/pw-metadata "$capid" target.object "$mic" >/dev/null 2>&1
+    # Sweep stray links: WirePlumber moves ITS link to the new target, but
+    # manually created links (auto-mic crossfade, past bugs) survive metadata
+    # retargets and leave the filter fed by TWO sources at once — with the
+    # sync wrappers' 45 ms delay that's an audible echo, and it made every
+    # link-order-based status reader flap. Anything not matching the new
+    # target gets unlinked; WirePlumber re-adds the right one if we race it.
+    ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | awk -v want="$mic" '
+      /^capture\.rnnoise_source:input/ { f = 1; next }
+      f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); print s }
+      f && /^[^[:space:]]/ { f = 0 }
+    ' | while IFS= read -r srcport; do
+      case "$srcport" in
+        "$mic":*) ;;   # the intended feed stays
+        *) ${pkgs.pipewire}/bin/pw-link -d "$srcport" "capture.rnnoise_source:input_MONO" 2>/dev/null ;;
+      esac
+    done
     echo done
   '';
 
@@ -466,6 +503,10 @@ let
         [ -n "$default" ] && [ "$default" != "combined_mics" ] && printf '%s\n' "$default" > "$prevfile"
         pactl set-default-source combined_mics
       fi
+      # Tell the auto-mic daemon to stand down IMMEDIATELY (it otherwise
+      # re-routes a single mic over the blend on the next speech window,
+      # which reads as "MIX turned itself off" + an echo).
+      ${pkgs.procps}/bin/pkill -HUP -f auto-mic-daemon.py 2>/dev/null || true
     else
       prev=$(cat "$prevfile" 2>/dev/null)
       # Only restore a mic that still exists; otherwise fall back.
@@ -477,6 +518,8 @@ let
       else
         pactl set-default-source "$prev"
       fi
+      # ...and resume single-mic duty (re-evaluate meters + feed belief).
+      ${pkgs.procps}/bin/pkill -HUP -f auto-mic-daemon.py 2>/dev/null || true
     fi
     echo done
   '';
@@ -514,11 +557,21 @@ let
         for (i = 1; i <= n; i++) {
           split(lines[i], f, "|")
           srcname[f[1]] = f[2]; srcdisp[f[1]] = f[3]
+          namedisp[f[2]] = f[3]   # name-keyed, to resolve delay wrappers
         }
       }
-      function flush() {
-        if (id != "" && nodename ~ /^capture\.combined_mics/ && (srcidx in srcname))
-          printf "%s|%s|%s|%s\n", id, srcname[srcidx], srcdisp[srcidx], vol
+      function flush(    nm, dp, real) {
+        if (id != "" && nodename ~ /^capture\.combined_mics/ && (srcidx in srcname)) {
+          nm = srcname[srcidx]; dp = srcdisp[srcidx]
+          # combined_mics captures the audio-mix-sync `delayed.<mic>` wrappers;
+          # present them as the real mic underneath
+          if (nm ~ /^delayed\./) {
+            real = substr(nm, 9)
+            if (real in namedisp) dp = namedisp[real]
+            nm = real
+          }
+          printf "%s|%s|%s|%s\n", id, nm, dp, vol
+        }
       }
       /^Source Output #/     { flush(); id = substr($3, 2); srcidx=""; vol=""; nodename="" }
       /^[[:space:]]*Source:/ { srcidx = $2 }
@@ -796,8 +849,13 @@ let
     ps.setuptools
   ]);
   vad-meter-py = pkgs.writeText "qs-vad-meter.py" ''
-    import sys, struct, math
+    import signal, sys, struct, math
     import webrtcvad
+
+    # Die quietly when our reader (the daemon) tears the pipeline down —
+    # Python's default turns SIGPIPE into a BrokenPipeError traceback that
+    # spams the journal on every meter stop.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
     RATE = 16000                 # WebRTC VAD supports 8/16/32/48k; 16k is the sweet spot
     FRAME_MS = 20                # VAD requires 10/20/30ms frames
@@ -937,6 +995,7 @@ let
     FILTER_STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "qs-rnnoise-on")
     VAD_METER = os.environ.get("AUTO_MIC_VAD_METER") or "qs-vad-meter"
     SET_INPUT = os.environ.get("AUTO_MIC_SET_INPUT") or "qs-rnnoise-set-input"
+    GET_INPUT = os.environ.get("AUTO_MIC_GET_INPUT") or "qs-rnnoise-current-input"
     RN_SOURCE = "rnnoise_source"
     RN_CAP_PORT = "capture.rnnoise_source:input_MONO"   # the filter's mono input port
 
@@ -1014,7 +1073,7 @@ let
             pass
 
     def real_sources():
-        """Real (non-monitor, non-rnnoise) capture sources, by node.name."""
+        """Real (non-monitor, non-virtual) capture sources, by node.name."""
         try:
             out = subprocess.run(["pactl", "list", "short", "sources"],
                                  capture_output=True, text=True, timeout=5).stdout
@@ -1025,7 +1084,11 @@ let
             parts = line.split()
             if len(parts) >= 2:
                 n = parts[1]
-                if n != RN_SOURCE and not n.endswith(".monitor"):
+                if (n != RN_SOURCE and n != "combined_mics"
+                        and not n.endswith(".monitor")
+                        and not n.startswith("delayed.")      # mix-sync wrappers
+                        and not n.startswith("pw-loopback")
+                        and "platform-snd_aloop" not in n):   # guest plumbing
                     names.append(n)
         return names
 
@@ -1133,6 +1196,8 @@ let
             self.left_at = {}       # mic -> monotonic when we last switched AWAY from it
             self.verify_at = 0.0    # last belief-vs-reality feed check
             self.verify_timer = None  # debounce for node-lifecycle feed checks
+            self.mix_active = False   # blend feeding the filter -> stand down
+            self.mix_check_at = 0.0
             self.lock = threading.RLock()
             self.reload = threading.Event()   # set by SIGHUP (config / filter change)
 
@@ -1145,6 +1210,20 @@ let
                 return True               # the filter-chain boots ON
         def auto_on(self):
             return bool(self.cfg.get("enabled"))
+        # MIX mode: the blend (combined_mics) feeds the filter, so per-mic
+        # switching is meaningless and the daemon must stand down — routing
+        # "back" to a single mic here is exactly the fight that both killed
+        # the MIX toggle instantly and left a raw mic linked ALONGSIDE the
+        # combiner (audible echo once the sync wrappers added real delay).
+        # Read the INTENT (target.object metadata) — not the live links,
+        # which lag during the retarget and made this racy.
+        def mix_on(self):
+            try:
+                out = subprocess.run([GET_INPUT], capture_output=True,
+                                     text=True, timeout=5).stdout.strip()
+                return out == "combined_mics"
+            except Exception:
+                return self._current_feed() == "combined_mics"
         def system_active(self):
             # We pin rnnoise_source as the default and manage routing whenever
             # EITHER the filter or auto-switch is on. With BOTH off we step aside
@@ -1268,6 +1347,14 @@ let
         def _select(self):
             now = time.monotonic()
             cfg = self.cfg
+            # Rate-limited MIX check (an exec per speech window would be
+            # heavy): while the blend feeds the filter, no selection at all.
+            if (now - self.mix_check_at) >= 2.0:
+                self.mix_check_at = now
+                self.mix_active = self.mix_on()
+            if self.mix_active:
+                self.pending = None
+                return
             cands = self._candidates()
 
             def is_viable(m, snr):
@@ -1351,7 +1438,10 @@ let
                     self.ensure_default_rnnoise()
                     self._sync_meters()
                     feed = self._current_feed()
-                    if not self.auto_on():
+                    self.mix_active = self.mix_on()
+                    if self.mix_active:
+                        pass        # MIX owns the feed; keep active_mic as-is
+                    elif not self.auto_on():
                         self._set_active(feed)
                     else:
                         cands = self._candidates()
@@ -1365,6 +1455,7 @@ let
                         # start/SIGHUP; the feed-drift check in _select self-heals
                         # any later divergence.
                         if target and feed != target:
+                            log("route (apply_state) ->", target)
                             self.route(target)
                         else:
                             self._set_active(target)
@@ -1392,11 +1483,15 @@ let
             with self.lock:
                 if not self.system_active():
                     return
+                self.mix_active = self.mix_on()
+                if self.mix_active:
+                    return          # blend is the intended feed; hands off
+                feed = self._current_feed()
                 cands = self._candidates()
                 target = self.active_mic
                 if self.auto_on() and target not in cands:
                     target = cands[0] if cands else None
-                if not target or self._current_feed() == target:
+                if not target or feed == target:
                     return
                 if not self._first_out_port(target):
                     return          # node not up yet; the next add event retries
@@ -1472,6 +1567,7 @@ let
     export PATH="${pkgs.pulseaudio}/bin:${pkgs.pipewire}/bin:$PATH"
     export AUTO_MIC_VAD_METER="${vad-meter-sh}/bin/audio-vad-meter"
     export AUTO_MIC_SET_INPUT="${rnnoise-set-input-sh}/bin/audio-rnnoise-set-input"
+    export AUTO_MIC_GET_INPUT="${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input"
     exec ${pkgs.python3}/bin/python ${auto-mic-daemon-py}
   '';
 
@@ -1672,6 +1768,278 @@ let
       END { if (name == target) emit() }
     '
   '';
+  # ── Mix-sync daemon ─────────────────────────────────────────────────────────
+  # Keeps every physical mic wrapped in a fixed-delay virtual source
+  # `delayed.<node.name>` (a pw-loopback with --delay), and calibrates the
+  # delays so all mics are time-aligned to the slowest one. combined_mics
+  # captures the wrappers, NOT the raw mics — so MIX mode mixes in-phase.
+  # A wireless dongle adds a large fixed transit delay its *reported* latency
+  # says nothing about (see combine.latency-compensate comment in
+  # pipewire.nix), so alignment is MEASURED: when the mix is live and a mic
+  # pair has no stored offset, the daemon records both raw mics during normal
+  # speech, cross-correlates, and stores the per-mic lag in
+  # $XDG_STATE_HOME/audio-mix-sync/offsets.json. Known mics sync instantly
+  # from the stored value (measured drift between sessions was < 0.1 ms).
+  # Event-driven: pactl subscribe for source add/remove (wrapper lifecycle)
+  # and for combined_mics state changes (calibration trigger). SIGHUP drops
+  # stored offsets and forces a fresh calibration.
+  mix-sync-daemon-py = pkgs.writeText "mix-sync-daemon.py" ''
+    import json, math, os, signal, struct, subprocess, threading, time
+
+    STATE_DIR = os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "audio-mix-sync")
+    OFFSETS = os.path.join(STATE_DIR, "offsets.json")
+
+    RATE = 48000
+    REC_S = 12           # calibration recording length
+    MAX_LAG_MS = 300     # search window; wireless links sit well inside this
+    MIN_PEAK = 1500      # min 16-bit peak in BOTH mics to accept a measurement
+    PROMINENCE = 1.5     # best/second-best xcorr ratio to accept a lag
+    RETRY_S = 30         # min seconds between calibration attempts
+
+    def log(*a):
+        print("[mix-sync]", *a, flush=True)
+
+    def real_mics():
+        """Physical mics only: usb/pci ALSA + bluetooth. Excludes monitors,
+        virtual sources (rnnoise/combined/delayed.*) and platform devices
+        like snd_aloop (whose input half would pipe played audio into the
+        mix)."""
+        try:
+            out = subprocess.run(["pactl", "list", "short", "sources"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return []
+        names = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                n = parts[1]
+                if (n.startswith("alsa_input.usb-") or n.startswith("alsa_input.pci-")
+                        or n.startswith("bluez_input.")):
+                    names.append(n)
+        return names
+
+    def record_pair(a, b, seconds):
+        """Simultaneously capture two raw mics; returns (samples_a, samples_b)."""
+        def rec(mic):
+            return subprocess.Popen(
+                ["parec", "--rate=%d" % RATE, "--channels=1", "--format=s16le",
+                 "-d", mic, "--client-name=mix-sync-cal"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        pa, pb = rec(a), rec(b)
+        want = RATE * seconds * 2
+        da = pa.stdout.read(want)
+        db = pb.stdout.read(want)
+        for p in (pa, pb):
+            p.kill()
+        n = min(len(da), len(db)) // 2
+        return (struct.unpack("<%dh" % n, da[:n*2]),
+                struct.unpack("<%dh" % n, db[:n*2]))
+
+    def xcorr_lag(a, b):
+        """Lag (samples) by which b trails a, or None if unconvincing.
+        Coarse-to-fine search around the loudest 2s of a."""
+        m = min(len(a), len(b))
+        if m < RATE * 4:
+            return None
+        a, b = a[:m], b[:m]
+        pa = max(max(a), -min(a)); pb = max(max(b), -min(b))
+        if pa < MIN_PEAK or pb < MIN_PEAK:
+            return None
+        w = 480
+        env = [max(abs(x) for x in a[i:i+w]) for i in range(0, m - w, w)]
+        c = max(range(len(env)), key=lambda i: sum(env[max(0, i-10):i+10])) * w
+        s0 = max(0, c - RATE); s1 = min(m, c + RATE)
+        span = int(RATE * MAX_LAG_MS / 1000)
+
+        def score(lag, step):
+            acc = 0
+            for i in range(s0, s1, step):
+                j = i + lag
+                if 0 <= j < m:
+                    acc += a[i] * b[j]
+            return acc
+
+        coarse = [(score(l, 16), l) for l in range(-span, span + 1, 24)]
+        coarse.sort(reverse=True)
+        best = coarse[0][1]
+        fine = [(score(l, 16), l)    # same stride as coarse so the
+                for l in range(best - 144, best + 145, 2)]  # prominence ratio compares like with like
+        fine.sort(reverse=True)
+        peak_v, peak_l = fine[0]
+        # prominence: compare against the best coarse score well away from
+        # the winner — a diffuse correlation (no shared speech) fails this.
+        rival = max((v for v, l in coarse if abs(l - peak_l) > RATE // 100),
+                    default=0)
+        if peak_v <= 0 or (rival > 0 and peak_v / rival < PROMINENCE):
+            return None
+        return peak_l
+
+    class Daemon:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.wrappers = {}     # mic -> (Popen, delay_s)
+            self.lags = {}         # mic -> lag seconds (gauge: first ref = 0)
+            self.measuring = False
+            self.last_attempt = 0.0
+            self.load()
+
+        def load(self):
+            try:
+                with open(OFFSETS) as f:
+                    self.lags = {k: float(v) for k, v in json.load(f).items()}
+                log("loaded offsets:", self.lags)
+            except Exception:
+                self.lags = {}
+
+        def save(self):
+            try:
+                os.makedirs(STATE_DIR, exist_ok=True)
+                with open(OFFSETS, "w") as f:
+                    json.dump(self.lags, f, indent=2)
+            except Exception as e:
+                log("state save failed:", e)
+
+        def delays(self, mics):
+            """Per-mic wrapper delay: pad everyone up to the slowest mic."""
+            known = [self.lags.get(m, 0.0) for m in mics]
+            top = max(known) if known else 0.0
+            return {m: max(0.0, top - self.lags.get(m, 0.0)) for m in mics}
+
+        def spawn(self, mic, delay):
+            cmd = ["pw-loopback", "-n", "sync." + mic, "-c", "1",
+                   "-m", "[ MONO ]", "--delay", "%.6f" % delay,
+                   "-C", mic,
+                   "-i", "node.passive=true node.dont-reconnect=true",
+                   "-o", ("media.class=Audio/Source node.name=delayed.%s "
+                          "node.description=\"%s (sync)\"") % (mic, mic)]
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            self.wrappers[mic] = (p, delay)
+            log("wrapper %s delay=%.1fms" % (mic, delay * 1000))
+
+        def kill(self, mic):
+            p, _ = self.wrappers.pop(mic)
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except Exception:
+                try: p.terminate()
+                except Exception: pass
+
+        def sync_wrappers(self):
+            with self.lock:
+                mics = real_mics()
+                want = self.delays(mics)
+                for mic in list(self.wrappers):
+                    p, d = self.wrappers[mic]
+                    dead = p.poll() is not None
+                    stale = mic in want and abs(want[mic] - d) > 0.001
+                    if mic not in want or dead or stale:
+                        self.kill(mic)
+                for mic, d in want.items():
+                    if mic not in self.wrappers:
+                        self.spawn(mic, d)
+
+        def need_calibration(self):
+            mics = real_mics()
+            unknown = [m for m in mics if m not in self.lags]
+            known = len(mics) - len(unknown)
+            # with no known mic, one unknown anchors the gauge at 0 and is
+            # not itself a measurement target — so 2+ unknowns are needed
+            return len(mics) >= 2 and len(unknown) >= (2 if known == 0 else 1)
+
+        def calibrate(self):
+            with self.lock:
+                if self.measuring:
+                    return
+                now = time.monotonic()
+                if now - self.last_attempt < RETRY_S:
+                    return
+                self.last_attempt = now
+                self.measuring = True
+            try:
+                mics = real_mics()
+                if len(mics) < 2:
+                    return
+                ref = next((m for m in mics if m in self.lags), mics[0])
+                if ref not in self.lags:
+                    self.lags[ref] = 0.0
+                targets = [m for m in mics if m != ref and m not in self.lags]
+                for mic in targets:
+                    log("calibrating %s vs %s (speak normally)" % (mic, ref))
+                    a, b = record_pair(ref, mic, REC_S)
+                    lag = xcorr_lag(a, b)
+                    if lag is None:
+                        log("no usable speech; will retry")
+                        continue
+                    self.lags[mic] = self.lags[ref] + lag / RATE
+                    log("measured: %s trails %s by %.2f ms"
+                        % (mic, ref, lag / 48.0))
+                    self.save()
+                self.sync_wrappers()
+            finally:
+                with self.lock:
+                    self.measuring = False
+
+        def maybe_calibrate_async(self):
+            if self.need_calibration():
+                threading.Thread(target=self.calibrate, daemon=True).start()
+
+        def reset(self):
+            with self.lock:
+                log("SIGHUP: dropping stored offsets, recalibrating")
+                self.lags = {}
+                self.save()
+                self.last_attempt = 0.0
+                self.sync_wrappers()
+            self.maybe_calibrate_async()
+
+        def run(self):
+            self.sync_wrappers()
+            self.maybe_calibrate_async()
+            try:
+                proc = subprocess.Popen(["pactl", "subscribe"],
+                                        stdout=subprocess.PIPE, text=True)
+            except Exception as e:
+                log("subscribe failed:", e)
+                return
+            for line in proc.stdout:
+                if " on source #" in line:
+                    if "'new'" in line or "'remove'" in line:
+                        self.sync_wrappers()
+                        self.maybe_calibrate_async()
+                    elif "'change'" in line:
+                        # combined_mics going RUNNING (mix turned on) arrives
+                        # as change events; cheap gate inside decides.
+                        self.maybe_calibrate_async()
+
+        def stop(self):
+            for mic in list(self.wrappers):
+                self.kill(mic)
+
+    def main():
+        d = Daemon()
+        signal.signal(signal.SIGHUP, lambda *_: d.reset())
+        try:
+            d.run()
+        finally:
+            d.stop()
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except KeyboardInterrupt:
+            pass
+  '';
+
+  mix-sync-daemon-sh = pkgs.writeShellScriptBin "audio-mix-sync-daemon" ''
+    export PATH="${pkgs.pulseaudio}/bin:${pkgs.pipewire}/bin:$PATH"
+    exec ${pkgs.python3}/bin/python ${mix-sync-daemon-py}
+  '';
+
   tools = [
     bt-audio-connect-sh
     list-sinks-sh
@@ -1702,6 +2070,7 @@ let
     auto-mic-daemon-sh
     auto-mic-read-sh
     auto-mic-mutate-sh
+    mix-sync-daemon-sh
   ];
 
   # Human-facing dispatcher: `audioctl rnnoise-toggle`, `audioctl list-sinks`,
@@ -1726,6 +2095,7 @@ rec {
   inherit
     audio-xrun-guard-sh
     auto-mic-daemon-sh
+    mix-sync-daemon-sh
     ;
 
   # Everything on PATH: audio-* tools + the audioctl dispatcher.

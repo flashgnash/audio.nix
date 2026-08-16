@@ -95,8 +95,14 @@ pipewire-screenaudio:
             "stream.rules" = [
               {
                 matches = [
-                  { "media.class" = "Audio/Source"; "node.name" = "~alsa_input.*"; }
-                  { "media.class" = "Audio/Source"; "node.name" = "~bluez_input.*"; }
+                  # Capture the audio-mix-sync daemon's time-aligned
+                  # `delayed.<mic>` wrappers, NOT raw devices: a wireless
+                  # mic's radio transit (~46 ms on the Arctis) made the raw
+                  # mix comb/echo, and a bare ~alsa_input.* also swept in the
+                  # snd_aloop loopback device (piping played audio straight
+                  # into the mic mix). The daemon wraps exactly the real
+                  # usb/pci/bluez mics and time-aligns them.
+                  { "media.class" = "Audio/Source"; "node.name" = "~delayed\\..*"; }
                 ];
                 actions = { create-stream = { }; };
               }
@@ -159,7 +165,11 @@ pipewire-screenaudio:
                     # that capture volume silently sitting at 42% (-22.6 dB) —
                     # starving the VAD of level. If clipping returns, check
                     # `pactl get-source-volume` on the mic before touching these.
-                    "VAD Threshold (%)" = 90.0;
+                    # 90 → 95 (2026-08-16): at 90 the fan's voiced-ish buzz kept
+                    # the gate open through long silences (measured: output
+                    # floor -44 dBFS continuous while quiet) and the AGC lifted
+                    # it. Speech at proper gain clears 95 comfortably.
+                    "VAD Threshold (%)" = 95.0;
                     "VAD Grace Period (ms)" = 1200;
                     "Retroactive VAD Grace (ms)" = 100;
                   };

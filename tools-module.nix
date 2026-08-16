@@ -38,6 +38,28 @@ in
       };
     };
 
+    # Mic mix-sync daemon: keeps a fixed-delay `delayed.<mic>` wrapper per
+    # physical mic and auto-measures the delays (speech cross-correlation) so
+    # MIX mode mixes in-phase. combined_mics captures these wrappers — with
+    # this service down, MIX mode has no inputs (single-mic mode unaffected).
+    systemd.user.services.audio-mix-sync = {
+      description = "Microphone mix time-alignment (auto-measured delays)";
+      after = [
+        "graphical-session.target"
+        "pipewire.service"
+        "wireplumber.service"
+        "pipewire-pulse.service"
+      ];
+      partOf = [ "graphical-session.target" ];
+      wantedBy = [ "graphical-session.target" ];
+      unitConfig.StartLimitIntervalSec = 0;
+      serviceConfig = {
+        ExecStart = "${tools.mix-sync-daemon-sh}/bin/audio-mix-sync-daemon";
+        Restart = "always";
+        RestartSec = "3s";
+      };
+    };
+
     # Auto-switch microphone daemon. Idle (spawns nothing) until the config
     # at ~/.config/auto-mic/config.json enables it with >=2 candidate mics.
     systemd.user.services.auto-mic = {
