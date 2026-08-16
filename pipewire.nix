@@ -77,9 +77,17 @@ pipewire-screenaudio:
             # processing cycle while the combiner itself is idle — a non-passive
             # combine stream can wedge the device driver (it waits on a stream
             # that never processes), which stalls the ENTIRE graph.
+            # async: passive is not enough — the links alone still merge every
+            # mic into ONE synchronous driver group behind a single clock, so a
+            # device that wedges at the hardware level (Blue at cold boot:
+            # stream starts, hw_ptr stays 0 forever) froze EVERY capture stream
+            # on the machine, including mics it wasn't feeding. Async streams
+            # keep each device in its own driver group at the cost of one
+            # quantum of latency on the (opt-in) MIX path only.
             "stream.props" = {
               "node.name" = "capture.combined_mics";
               "node.passive" = true;
+              "node.async" = true;
             };
             "stream.rules" = [
               {
@@ -120,18 +128,22 @@ pipewire-screenaudio:
                   plugin = "librnnoise_ladspa";
                   label = "noise_suppressor_mono";
                   control = {
-                    # Threshold stays HIGH (90%) so near-silent input is gated and
+                    # Threshold stays high so near-silent input is gated and
                     # RNNoise can't hallucinate buzzing / half-voices when you're
                     # quiet. To avoid clipping speech, the GRACE keeps the gate open
-                    # once real speech has opened it: 700ms holds it through soft
-                    # mid-sentence parts and trailing ends (gaps under 700ms don't
-                    # close it), and only sustained silence past that re-gates it.
-                    # Retroactive grace passes the ~40ms before onset so word starts
-                    # aren't clipped. (Don't lower the threshold to fix clipping —
-                    # that re-opens the hallucination; widen grace instead.)
-                    "VAD Threshold (%)" = 90.0;
-                    "VAD Grace Period (ms)" = 700;
-                    "Retroactive VAD Grace (ms)" = 40;
+                    # once real speech has opened it: it holds through soft
+                    # mid-sentence parts and trailing ends, and only sustained
+                    # silence past it re-gates. Retroactive grace passes the moment
+                    # before onset so word starts aren't clipped.
+                    # 2026-08-16: 90/700/40 → 85/1200/100 — the Arctis headset mic
+                    # (mono, lower SNR than the Blue up close) clipped word endings:
+                    # soft tails never reached 90% confidence, so the gate closed
+                    # mid-word once the grace ran out. If buzzing/half-voices return
+                    # when idle, raise the threshold back toward 90 before touching
+                    # the grace.
+                    "VAD Threshold (%)" = 85.0;
+                    "VAD Grace Period (ms)" = 1200;
+                    "Retroactive VAD Grace (ms)" = 100;
                   };
                 }
                 {

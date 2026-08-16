@@ -879,6 +879,20 @@ let
   # level-meter-sh's parec wiring at 16kHz (VAD's native rate). Names itself
   # "qs-vad" so the mic-users enumerator drops it (these taps read real mics and
   # would otherwise each list as a mic user / trip the in-use indicator).
+  #
+  # The stream must stay pinned to ITS mic, or die trying: without these props,
+  # a device re-enumeration (Arctis dongle sleep/wake, USB replug) makes
+  # WirePlumber move the orphaned stream to the default source — rnnoise_source
+  # — and because every qs-vad stream shares one stream-restore key
+  # (by-application-name), that migrated target then gets saved and applied to
+  # ALL qs-vad streams. Every meter ends up listening to the active mic, so the
+  # daemon can never hear speech on any other candidate and never switches.
+  #   node.dont-reconnect    — kill the stream when its device vanishes instead
+  #                            of migrating it (the daemon revives it on the
+  #                            device's return)
+  #   state.restore-target   — never save/apply a stream-restore target for
+  #                            these streams (also neutralises any previously
+  #                            poisoned saved entry)
   #   $1  parec device (default @DEFAULT_SOURCE@; pass a source name per mic)
   #   $2  optional VAD aggressiveness 0..3 (default 2)
   vad-meter-sh = pkgs.writeShellScriptBin "audio-vad-meter" ''
@@ -886,7 +900,9 @@ let
     agg="''${2:-2}"
     exec ${pkgs.pulseaudio}/bin/parec --rate=16000 --channels=1 --format=s16le --latency-msec=20 \
       -d "$target" \
-      --client-name=qs-vad --stream-name=qs-vad 2>/dev/null \
+      --client-name=qs-vad --stream-name=qs-vad \
+      --property=node.dont-reconnect=true \
+      --property=state.restore-target=false 2>/dev/null \
       | ${vad-python}/bin/python ${vad-meter-py} "$agg"
   '';
 
@@ -1082,6 +1098,12 @@ let
                     return False
                 return (now - self.voice_start) * 1000.0 >= viable_ms
 
+        # The meter pipeline exits when its device vanishes (node.dont-reconnect)
+        # — by design, so it can't silently migrate to another source. A dead
+        # meter is respawned by _sync_meters on the next node event.
+        def alive(self):
+            return self.proc.poll() is None
+
         # True if this mic has been producing essentially no signal (muted /
         # unplugged / dead) for at least hold_ms — distinct from a merely quiet room.
         def is_dead(self, now, hold_ms):
@@ -1110,6 +1132,7 @@ let
             self.last_switch = 0.0
             self.left_at = {}       # mic -> monotonic when we last switched AWAY from it
             self.verify_at = 0.0    # last belief-vs-reality feed check
+            self.verify_timer = None  # debounce for node-lifecycle feed checks
             self.lock = threading.RLock()
             self.reload = threading.Event()   # set by SIGHUP (config / filter change)
 
@@ -1142,12 +1165,21 @@ let
             except Exception:
                 pass
 
-        # One VAD meter per candidate, but ONLY while auto-switching is on.
+        # One VAD meter per candidate, but ONLY while auto-switching is on,
+        # and ONLY for devices that are actually present: node.dont-reconnect
+        # stops a stream migrating when its device vanishes, but at CREATION
+        # pipewire-pulse still falls back to the default source — a meter
+        # spawned for an unplugged mic silently listens to rnnoise_source,
+        # reports the active mic's speech as its own, and the daemon flaps
+        # the live mic mid-sentence (seen live: two ghost meters for absent
+        # mics made calls unusable). Node add events re-run this, so a mic
+        # gets its meter the moment it appears. Also revives dead meters
+        # (a meter dies with its device, by design).
         def _sync_meters(self):
-            want = (set(self._candidates())
+            want = (set(self._candidates()) & set(real_sources())
                     if (self.auto_on() and len(self._candidates()) >= 2) else set())
             for mic in list(self.meters):
-                if mic not in want:
+                if mic not in want or not self.meters[mic].alive():
                     self.meters.pop(mic).stop()
             for mic in want:
                 if mic not in self.meters:
@@ -1264,7 +1296,8 @@ let
                 # convinced the desired mic is live while another — possibly
                 # muted — one actually feeds the capture. Rate-limited so the
                 # pw-link exec cost stays negligible; still event-driven (only
-                # runs on speech windows).
+                # runs on speech windows — verify_feed covers the silent-feed
+                # case where no speech window can ever fire).
                 if (now - self.verify_at) >= 2.0:
                     self.verify_at = now
                     if self._current_feed() != desired:
@@ -1347,7 +1380,50 @@ let
                 log("state: active=%s auto=%s filter=%s mic=%s"
                     % (self.system_active(), self.auto_on(), self.filter_on(), self.active_mic))
 
-        # ── default-change events (pactl subscribe; no clock polling) ─────
+        # ── node-lifecycle feed check ─────────────────────────────────────
+        # The feed-drift check in _select only runs on speech windows, so it
+        # is deaf to the failure it exists to repair when the feed itself is
+        # the break: a mis-linked feed means rnnoise outputs silence, the
+        # meters hear silence, no speech window ever fires, and the check
+        # never runs (boot race: WirePlumber links the filter's capture
+        # before the USB mic's node exists, then never revisits). This check
+        # runs on source add/remove events instead — no audio required.
+        def verify_feed(self):
+            with self.lock:
+                if not self.system_active():
+                    return
+                cands = self._candidates()
+                target = self.active_mic
+                if self.auto_on() and target not in cands:
+                    target = cands[0] if cands else None
+                if not target or self._current_feed() == target:
+                    return
+                if not self._first_out_port(target):
+                    return          # node not up yet; the next add event retries
+                self.ensure_default_rnnoise()
+                self.route(target)
+                self.last_switch = time.monotonic()
+                log("re-route (node event) ->", target)
+
+        # Node event settled: revive any meters that died with their device,
+        # then make feed belief match reality.
+        def _on_node_event(self):
+            with self.lock:
+                self._sync_meters()
+            self.verify_feed()
+
+        def _schedule_verify(self):
+            # Coalesce the event burst a device add/remove emits, and give a
+            # fresh node a moment to expose its ports before checking. One-shot
+            # timer armed per event — still event-driven, no clock polling.
+            with self.lock:
+                if self.verify_timer is not None:
+                    self.verify_timer.cancel()
+                self.verify_timer = threading.Timer(0.5, self._on_node_event)
+                self.verify_timer.daemon = True
+                self.verify_timer.start()
+
+        # ── default-change + node events (pactl subscribe; no polling) ────
         def watch_default(self):
             try:
                 proc = subprocess.Popen(["pactl", "subscribe"],
@@ -1360,6 +1436,10 @@ let
                     with self.lock:
                         if self.system_active():
                             self.ensure_default_rnnoise()
+                elif " on source #" in line and ("'new'" in line or "'remove'" in line):
+                    # NB: " on source #" — a bare " on source" also matches
+                    # "on source-output", i.e. every app stream open/close.
+                    self._schedule_verify()      # device appeared/vanished
 
         def reload_loop(self):
             while True:
@@ -1372,6 +1452,7 @@ let
             log("started; config", CONFIG)
             self.apply_state()
             threading.Thread(target=self.reload_loop, daemon=True).start()
+            self._schedule_verify()   # cover nodes that appear before subscribe attaches
             self.watch_default()                 # blocks main thread; event-driven
 
     def main():
