@@ -135,13 +135,14 @@ pipewire-screenaudio:
                     # mid-sentence parts and trailing ends, and only sustained
                     # silence past it re-gates. Retroactive grace passes the moment
                     # before onset so word starts aren't clipped.
-                    # 2026-08-16: 90/700/40 → 85/1200/100 — the Arctis headset mic
-                    # (mono, lower SNR than the Blue up close) clipped word endings:
-                    # soft tails never reached 90% confidence, so the gate closed
-                    # mid-word once the grace ran out. If buzzing/half-voices return
-                    # when idle, raise the threshold back toward 90 before touching
-                    # the grace.
-                    "VAD Threshold (%)" = 85.0;
+                    # 2026-08-16: grace 700/40 → 1200/100 for soft trailing words.
+                    # Threshold stays 90: an 85 experiment promptly brought the
+                    # hallucination back once the Blue's capture volume was
+                    # restored to 100%. NB the REAL cause of "words cut off" was
+                    # that capture volume silently sitting at 42% (-22.6 dB) —
+                    # starving the VAD of level. If clipping returns, check
+                    # `pactl get-source-volume` on the mic before touching these.
+                    "VAD Threshold (%)" = 90.0;
                     "VAD Grace Period (ms)" = 1200;
                     "Retroactive VAD Grace (ms)" = 100;
                   };
