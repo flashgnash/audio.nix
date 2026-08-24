@@ -867,6 +867,8 @@ let
     FRAME_BYTES = FRAME_SAMPLES * 2          # s16 mono
     GROUP = 3                    # emit one line per GROUP frames (~60ms)
     NF_ALPHA = 0.03              # noise-floor EWMA follow rate (per non-speech frame)
+    MINSTAT_SUB = 50             # frames per min-stat sub-window (~1s at 20ms)
+    MINSTAT_N = 8                # sub-windows kept (~8s of history)
     FLOOR_DB = -70.0             # dBFS that maps to level 0 — low enough that a dead
                                  # (muted/unplugged) mic reads ~0 while a merely-quiet
                                  # room still reads > 0 (so the daemon can tell them apart)
@@ -879,6 +881,19 @@ let
     # Noise floor in dBFS, tracked from non-speech frames only. Starts conservative
     # so early SNR is sane before it settles to the mic's real floor.
     noise_db = -60.0
+
+    # Minimum-statistics floor over ALL frames (speech-classified or not).
+    # WebRTC VAD classifies steady broadband noise (a PC fan right next to a
+    # mic) as speech most of the time; with the EWMA floor fed only by
+    # non-speech frames it then never learns the fan's level, SNR reads as
+    # fan_peak minus a stale -60 floor, and the daemon treats the fan as a
+    # person. A fan is CONTINUOUS, so the minimum level over the last ~8s
+    # equals the fan level; real speech always has inter-word dips down to
+    # the room floor. Taking max(ewma, min_stat) as the effective floor
+    # collapses fan "SNR" to ~0 while leaving genuine speech SNR intact.
+    minima = []          # completed sub-window minima, newest last
+    sub_min = 0.0        # running min of the current sub-window (dBFS <= 0)
+    sub_n = 0
 
     def dbfs(frame):
         n = len(frame) // 2
@@ -914,6 +929,14 @@ let
             db = dbfs(frame)
             if db > win_peak:
                 win_peak = db
+            if sub_n == 0 or db < sub_min:
+                sub_min = db
+            sub_n += 1
+            if sub_n >= MINSTAT_SUB:
+                minima.append(sub_min)
+                if len(minima) > MINSTAT_N:
+                    minima.pop(0)
+                sub_n = 0
             if speech:
                 voiced += 1
                 if db > peak_db:
@@ -928,7 +951,11 @@ let
                 # selection signal — and is 0 on non-speech windows as before.
                 level = (win_peak - FLOOR_DB) / (-FLOOR_DB) * 100.0
                 level = max(0.0, min(100.0, level))
-                snr = max(0.0, peak_db - noise_db) if is_speech else 0.0
+                floor = noise_db
+                stat = minima + ([sub_min] if sub_n else [])
+                if stat:
+                    floor = max(floor, min(stat))
+                snr = max(0.0, peak_db - floor) if is_speech else 0.0
                 sys.stdout.write("%d %d %d\n" % (is_speech, int(snr), int(level)))
                 sys.stdout.flush()
                 voiced = 0
