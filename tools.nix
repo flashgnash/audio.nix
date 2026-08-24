@@ -103,8 +103,11 @@ let
       /alsa\.device = / { match($0, /"[^"]*"/); alsa_device = substr($0, RSTART+1, RLENGTH-2) }
       END { if (name != "") emit() }
     '
-    # Unconnected BT audio sinks (Audio Sink UUID: 0000110b)
-    bluetoothctl devices 2>/dev/null | awk '{print $2}' | while read -r mac; do
+    # Unconnected but PAIRED BT audio sinks (Audio Sink UUID: 0000110b).
+    # Only paired devices belong in the picker; `bluetoothctl devices` lists every
+    # seen device, so filter with the piped `devices Paired` form (also the robust
+    # form under bluez 5.86, where bare non-interactive subcommands are flaky).
+    printf 'devices Paired\nquit\n' | bluetoothctl 2>/dev/null | awk '/^Device /{print $2}' | while read -r mac; do
       [ -z "$mac" ] && continue
       mac_under=$(echo "$mac" | tr ':' '_')
       pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -q "$mac_under" && continue
@@ -175,8 +178,9 @@ let
       /alsa\.device = / { match($0, /"[^"]*"/); alsa_device = substr($0, RSTART+1, RLENGTH-2) }
       END { emit() }
     '
-    # Unconnected BT audio sources (Headset UUID: 0000111e)
-    bluetoothctl devices 2>/dev/null | awk '{print $2}' | while read -r mac; do
+    # Unconnected but PAIRED BT audio sources (Headset UUID: 0000111e).
+    # Paired-only (see list-sinks): filter with the piped `devices Paired` form.
+    printf 'devices Paired\nquit\n' | bluetoothctl 2>/dev/null | awk '/^Device /{print $2}' | while read -r mac; do
       [ -z "$mac" ] && continue
       mac_under=$(echo "$mac" | tr ':' '_')
       pactl list short sources 2>/dev/null | awk '{print $2}' | grep -q "$mac_under" && continue
