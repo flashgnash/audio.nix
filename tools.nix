@@ -90,6 +90,10 @@ let
         # combined_out (output duplicator) is represented by the MIX toggle,
         # not a device row.
         if (name == "combined_out") return
+        # tailnet-audio mic-donation plumbing: a null-sink whose monitor becomes a
+        # donated mic source. Internal, not a usable output, so hide it. The
+        # phone-SPEAKER sink is tailnet-out-* and DOES belong in this list.
+        if (name ~ /^tailnet-mic-/) return
         bt  = (name ~ /^bluez_/) ? 1 : 0
         cur = (name == def) ? "1" : "0"
         printf "%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt
