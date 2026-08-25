@@ -134,7 +134,14 @@ let
     if [ -n "$capid" ]; then
       t=$(${pkgs.pipewire}/bin/pw-metadata "$capid" target.object 2>/dev/null \
         | awk -F"'" "/key:'target.object'/ { print \$4; exit }")
-      [ -n "$t" ] && { echo "$t"; exit 0; }
+      # Only trust the stored intent if that node still EXISTS. A mic that was
+      # selected then removed (e.g. a disconnected network/USB mic) leaves stale
+      # intent pointing at a dead node; trusting it blindly breaks the bar's
+      # active-mic resolution. If it's gone, fall through to the live link.
+      if [ -n "$t" ] && ${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+           | ${pkgs.jq}/bin/jq -e --arg n "$t" 'any(.[]; .info.props["node.name"] == $n)' >/dev/null; then
+        echo "$t"; exit 0
+      fi
     fi
     # Fallback (no metadata yet, e.g. fresh boot): first live link.
     ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | awk '
@@ -734,6 +741,9 @@ let
         case "$nodename" in capture.combined_mics*)
           [ "$client" = "n/a" ] && continue ;;
         esac
+        # (tailnet-audio donated mics are plain pipe-source nodes with no internal
+        # capture stream, so they need no exclusion here — they behave exactly
+        # like a hardware mic and are counted in-use only when a real app captures.)
         # The screen recorder's always-on mic capture (replay buffer). It is
         # always listening by design, so it shouldn't read as an app actively
         # using the mic — but only skip it when it's PROVABLY the real recorder
