@@ -2085,8 +2085,29 @@ let
     exec ${pkgs.python3}/bin/python ${mix-sync-daemon-py}
   '';
 
+  # Global "recency of use" store for the unified audio device list. `touch <key>`
+  # stamps a device (any kind — local sink/source, BT mac, cast name, tailnet
+  # host:sink) with the current time; `list` prints `key<TAB>epoch` for the panel
+  # to sort by. Keys never contain tabs.
+  recency-sh = pkgs.writeShellScriptBin "audio-recency" ''
+    f="''${XDG_STATE_HOME:-$HOME/.local/state}/qs-audio/recency"
+    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$f")"
+    case "$1" in
+      touch)
+        key="$2"; [ -z "$key" ] && exit 0
+        ts=$(${pkgs.coreutils}/bin/date +%s)
+        tmp="$f.$$"
+        { ${pkgs.gnugrep}/bin/grep -vF "$key	" "$f" 2>/dev/null; printf '%s\t%s\n' "$key" "$ts"; } > "$tmp" \
+          && ${pkgs.coreutils}/bin/mv "$tmp" "$f"
+        ;;
+      list) ${pkgs.coreutils}/bin/cat "$f" 2>/dev/null ;;
+      *) echo "usage: audio-recency touch <key> | list" >&2; exit 1 ;;
+    esac
+  '';
+
   tools = [
     bt-audio-connect-sh
+    recency-sh
     list-sinks-sh
     list-sources-sh
     list-sink-inputs-sh
