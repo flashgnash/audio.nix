@@ -91,15 +91,21 @@ let
         # not a device row.
         if (name == "combined_out") return
         # tailnet-audio mic-donation plumbing: a null-sink whose monitor becomes a
-        # donated mic source. Internal, not a usable output, so hide it. The
-        # phone-SPEAKER sink is tailnet-out-* and DOES belong in this list.
+        # donated mic source. The phone-SPEAKER sink is tailnet-out-<host> and DOES
+        # belong here (a usable output = your phone).
         if (name ~ /^tailnet-mic-/) return
+        # Local PROXY sinks for a REMOTE output are represented by their remote
+        # device row (tailnet/cast), so hide the proxy to avoid a duplicate: the
+        # route proxy carries tailnet_audio.route, and cast proxies are cast*_ .
+        if (is_route) return
+        if (name ~ /^castaudio_/ || name ~ /^cast_/) return
         bt  = (name ~ /^bluez_/) ? 1 : 0
         cur = (name == def) ? "1" : "0"
         printf "%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt
       }
+      /tailnet_audio\.route/ { is_route = 1 }
       /^Sink #/  { if (name != "") emit()
-                   name = ""; desc = ""; port = ""; alsa_card = ""; alsa_device = "" }
+                   name = ""; desc = ""; port = ""; alsa_card = ""; alsa_device = ""; is_route = 0 }
       /^\tName:/        { name = $2 }
       /^\tDescription:/ { desc = substr($0, index($0, $2)) }
       /^\tActive Port:/ { port = $3 }
@@ -2105,9 +2111,20 @@ let
     esac
   '';
 
+  # "net" if the default output is a tailnet-audio route proxy sink (its display
+  # name is the remote DEVICE name, so the raw sink name is the only tell),
+  # else "local" — drives the bar's network badge.
+  default-sink-kind-sh = pkgs.writeShellScriptBin "audio-default-sink-kind" ''
+    case "$(${pkgs.pulseaudio}/bin/pactl get-default-sink 2>/dev/null)" in
+      tailnet-out-*) echo net ;;
+      *) echo local ;;
+    esac
+  '';
+
   tools = [
     bt-audio-connect-sh
     recency-sh
+    default-sink-kind-sh
     list-sinks-sh
     list-sources-sh
     list-sink-inputs-sh
