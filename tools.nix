@@ -99,6 +99,9 @@ let
         # route proxy carries tailnet_audio.route, and cast proxies are cast*_ .
         if (is_route) return
         if (name ~ /^castaudio_/ || name ~ /^cast_/) return
+        # snd_aloop loopback ("Loopback Analog Stereo", guest-gaming plumbing)
+        # is internal, never user-selectable — same rule as list-sources.
+        if (name ~ /platform-snd_aloop/) return
         bt  = (name ~ /^bluez_/) ? 1 : 0
         cur = (name == def) ? "1" : "0"
         printf "%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt
@@ -247,7 +250,14 @@ let
     else
       [ -n "$default" ] && printf '%s\n' "$default" > "$prevfile"
       if ! have_combined; then
-        pactl load-module module-combine-sink sink_name=combined_out >/dev/null
+        # Explicit slaves = every current sink minus the snd_aloop loopback
+        # (guest-gaming plumbing — mirroring into it would pipe host audio
+        # into the guest capture side). Trade-off vs bare load: a sink
+        # hotplugged while MIX is on isn't added until MIX is re-toggled.
+        slaves=$(pactl list short sinks 2>/dev/null | awk '
+          $2 != "combined_out" && $2 !~ /platform-snd_aloop/ { s = s (s ? "," : "") $2 }
+          END { print s }')
+        pactl load-module module-combine-sink sink_name=combined_out slaves="$slaves" >/dev/null
         # Bounded wait for the sink to materialise before pointing the
         # default at it (module load returns before the node exists).
         for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -267,7 +277,9 @@ let
   list-dup-sinks-sh = pkgs.writeShellScriptBin "audio-list-dup-sinks" ''
     sinks=$(pactl list sinks | awk '
       ${audio-naming-awk}
-      function emit() { if (name != "") printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
+      # snd_aloop excluded from the combine slaves; drop it here too so a
+      # stray stream into it never grows a mixer row.
+      function emit() { if (name != "" && name !~ /platform-snd_aloop/) printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
       /^Sink #/ { emit(); idx = substr($2, 2); name=""; desc=""; port=""; alsa_card=""; alsa_device="" }
       /^\tName:/        { name = $2 }
       /^\tDescription:/ { desc = substr($0, index($0, $2)) }
