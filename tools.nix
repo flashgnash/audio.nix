@@ -249,14 +249,16 @@ let
         | while read -r mid; do pactl unload-module "$mid"; done
     else
       [ -n "$default" ] && printf '%s\n' "$default" > "$prevfile"
+      # Seed the mix-set with just this output if unset → MIX starts with ONLY
+      # the current default output; add others via the chain-link.
+      [ -n "$default" ] && ${mixset-mutate-sh}/bin/audio-mixset-mutate snk seed "$default" >/dev/null 2>&1
       if ! have_combined; then
-        # Explicit slaves = every current sink minus the snd_aloop loopback
-        # (guest-gaming plumbing — mirroring into it would pipe host audio
-        # into the guest capture side). Trade-off vs bare load: a sink
-        # hotplugged while MIX is on isn't added until MIX is re-toggled.
-        slaves=$(pactl list short sinks 2>/dev/null | awk '
-          $2 != "combined_out" && $2 !~ /platform-snd_aloop/ { s = s (s ? "," : "") $2 }
-          END { print s }')
+        # Slaves come from the mix-set (chosen outputs) if any, else every
+        # current sink minus the snd_aloop loopback (guest-gaming plumbing —
+        # mirroring into it would pipe host audio into the guest capture side).
+        # Trade-off vs bare load: a sink hotplugged while MIX is on isn't added
+        # until MIX is re-toggled (or a chain-link toggle triggers a reload).
+        slaves=$(${mixset-slaves-sh}/bin/audio-mixset-slaves)
         pactl load-module module-combine-sink sink_name=combined_out slaves="$slaves" >/dev/null
         # Bounded wait for the sink to materialise before pointing the
         # default at it (module load returns before the node exists).
@@ -267,6 +269,51 @@ let
       fi
       pactl set-default-sink combined_out
     fi
+    echo done
+  '';
+
+  # Comma-separated slave list for combined_out: the mix-set's chosen sinks
+  # (intersected with what's actually present) if the set is non-empty, else
+  # every present sink minus the snd_aloop loopback. Falls back to all if the
+  # chosen set has no present members (never build an empty combine sink).
+  mixset-slaves-sh = pkgs.writeShellScriptBin "audio-mixset-slaves" ''
+    cfg=${mixset-config-path}
+    present=$(pactl list short sinks 2>/dev/null | awk '
+      $2 != "combined_out" && $2 !~ /platform-snd_aloop/ { print $2 }')
+    chosen=""
+    [ -f "$cfg" ] && chosen=$(${pkgs.jq}/bin/jq -r '(.sinks // [])[]' "$cfg" 2>/dev/null)
+    slaves=""
+    if [ -n "$chosen" ]; then
+      for s in $chosen; do
+        printf '%s\n' "$present" | grep -qxF "$s" && slaves="$slaves''${slaves:+,}$s"
+      done
+    fi
+    [ -z "$slaves" ] && slaves=$(printf '%s\n' "$present" | ${pkgs.coreutils}/bin/paste -sd,)
+    printf '%s\n' "$slaves"
+  '';
+
+  # Rebuild combined_out with the current mix-set slaves — but only if the
+  # output-duplicate is live (default == combined_out). Called when the sink
+  # mix-set changes so edits apply immediately. Parks the default on a real sink
+  # during the swap so streams aren't orphaned, then points it back.
+  outdup-reload-sh = pkgs.writeShellScriptBin "audio-outdup-reload" ''
+    [ "$(pactl get-default-sink 2>/dev/null)" = "combined_out" ] || exit 0
+    slaves=$(${mixset-slaves-sh}/bin/audio-mixset-slaves)
+    [ -z "$slaves" ] && exit 0
+    safe=$(cat "$XDG_RUNTIME_DIR/qs-outdup-prev" 2>/dev/null)
+    pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF "$safe" || \
+      safe=$(pactl list short sinks 2>/dev/null | awk '
+        $2 ~ /^(alsa_output|bluez_output)/ && $2 !~ /snd_aloop/ { print $2; exit }')
+    [ -n "$safe" ] && pactl set-default-sink "$safe"
+    pactl list short modules 2>/dev/null \
+      | awk '$2 == "module-combine-sink" && $0 ~ /sink_name=combined_out/ { print $1 }' \
+      | while read -r mid; do pactl unload-module "$mid"; done
+    pactl load-module module-combine-sink sink_name=combined_out slaves="$slaves" >/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF combined_out && break
+      sleep 0.2
+    done
+    pactl set-default-sink combined_out
     echo done
   '';
 
@@ -536,10 +583,17 @@ let
         [ -n "$default" ] && [ "$default" != "combined_mics" ] && printf '%s\n' "$default" > "$prevfile"
         pactl set-default-source combined_mics
       fi
+      # Seed the mix-set with just this mic if it's unset, so MIX starts with
+      # ONLY the current default mic (add others via the chain-link) rather than
+      # blending everything. prevfile now holds exactly that mic.
+      seed_mic=$(cat "$prevfile" 2>/dev/null)
+      [ -n "$seed_mic" ] && ${mixset-mutate-sh}/bin/audio-mixset-mutate src seed "$seed_mic" >/dev/null 2>&1
       # Tell the auto-mic daemon to stand down IMMEDIATELY (it otherwise
       # re-routes a single mic over the blend on the next speech window,
-      # which reads as "MIX turned itself off" + an echo).
+      # which reads as "MIX turned itself off" + an echo); and nudge the
+      # mix-sync daemon so combined_mics narrows to the seeded set.
       ${pkgs.procps}/bin/pkill -HUP -f auto-mic-daemon.py 2>/dev/null || true
+      ${pkgs.procps}/bin/pkill -USR1 -f mix-sync-daemon.py 2>/dev/null || true
     else
       prev=$(cat "$prevfile" 2>/dev/null)
       # Only restore a mic that still exists; otherwise fall back.
@@ -1707,6 +1761,71 @@ let
     echo done
   '';
 
+  # ── Mix-set: which devices participate in MIX (blend / output-duplicate) ────
+  # Separate from the auto-switch set (which is ordered). Two UNORDERED sets:
+  #   sources  → mics that combined_mics blends   (empty = ALL, back-compat)
+  #   sinks    → outputs that combined_out feeds   (empty = ALL, back-compat)
+  # The quickshell chain-link button toggles membership per device, per tab.
+  mixset-config-path = ''"''${XDG_CONFIG_HOME:-$HOME/.config}/audio-mix/config.json"'';
+
+  # Emit membership as parseable lines:  src|<node.name>   snk|<node.name>
+  mixset-read-sh = pkgs.writeShellScriptBin "audio-mixset-read" ''
+    cfg=${mixset-config-path}
+    if [ -f "$cfg" ]; then
+      ${pkgs.jq}/bin/jq -r '
+        ((.sources // [])[] | "src|" + .),
+        ((.sinks   // [])[] | "snk|" + .)
+      ' "$cfg" 2>/dev/null
+    fi
+    exit 0
+  '';
+
+  # Toggle a device in/out of a set:  audio-mixset-mutate <src|snk> toggle <name>
+  # Applies live: a source change nudges the mix-sync daemon (re-evaluates which
+  # mics get delayed.* wrappers → combined_mics); a sink change rebuilds
+  # combined_out's slave list if the output-duplicate is currently active.
+  mixset-mutate-sh = pkgs.writeShellScriptBin "audio-mixset-mutate" ''
+    cfg=${mixset-config-path}
+    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$cfg")"
+    [ -f "$cfg" ] || echo '{"sources":[],"sinks":[]}' > "$cfg"
+    kind="$1"; cmd="$2"; name="$3"
+    case "$kind" in
+      src) key=sources ;;
+      snk) key=sinks ;;
+      *) echo "bad kind: $kind" >&2; exit 1 ;;
+    esac
+    tmp=$(${pkgs.coreutils}/bin/mktemp)
+    apply=1
+    case "$cmd" in
+      toggle)
+        # Plain add/remove. The set is EXPLICIT (seeded on MIX-enable with the
+        # default device — see micblend-set / outdup-toggle), so no empty=all.
+        ${pkgs.jq}/bin/jq --arg k "$key" --arg n "$name" '
+          ([$k]) as $p | (getpath($p) // []) as $a |
+          setpath($p; (if ($a | index($n)) then ($a - [$n]) else ($a + [$n]) end))
+        ' "$cfg" > "$tmp" ;;
+      seed)
+        # Set to exactly [name] ONLY if currently empty — used when MIX turns on
+        # so it starts with just the default device. No live re-apply (the
+        # caller sets up the combine right after).
+        apply=0
+        ${pkgs.jq}/bin/jq --arg k "$key" --arg n "$name" '
+          ([$k]) as $p | (getpath($p) // []) as $a |
+          setpath($p; (if ($a | length) == 0 then [$n] else $a end))
+        ' "$cfg" > "$tmp" ;;
+      *) ${pkgs.coreutils}/bin/rm -f "$tmp"; echo "unknown command: $cmd" >&2; exit 1 ;;
+    esac
+    if [ -s "$tmp" ]; then ${pkgs.coreutils}/bin/mv "$tmp" "$cfg"; else ${pkgs.coreutils}/bin/rm -f "$tmp"; fi
+    if [ "$apply" = 1 ]; then
+      if [ "$kind" = src ]; then
+        ${pkgs.procps}/bin/pkill -USR1 -f mix-sync-daemon.py 2>/dev/null || true
+      else
+        ${outdup-reload-sh}/bin/audio-outdup-reload 2>/dev/null || true
+      fi
+    fi
+    echo done
+  '';
+
   list-sink-inputs-sh = pkgs.writeShellScriptBin "audio-list-sink-inputs" ''
     titlesfile=$(mktemp)
     namesfile=$(mktemp)
@@ -1781,12 +1900,13 @@ let
         if (id == "" || nodename ~ /^output\.combined_out/) return
         title = (pid in titles) ? titles[pid] : ""
         if (pid in enames) name = enames[pid]
-        printf "%s|%s|%s|%s|%s|%s\n", id, name, vol, muted, binary, title
+        printf "%s|%s|%s|%s|%s|%s|%s\n", id, name, vol, muted, binary, corked, title
       }
       /^Sink Input #/ {
         emit()
-        id = substr($3, 2); name = "Unknown"; vol = 100; muted = 0; binary = ""; pid = ""; nodename = ""
+        id = substr($3, 2); name = "Unknown"; vol = 100; muted = 0; binary = ""; pid = ""; nodename = ""; corked = 0
       }
+      /Corked:/    { corked = ($2 == "yes") ? 1 : 0 }
       /Mute:/      { muted = ($2 == "yes") ? 1 : 0 }
       /Volume:.*%/ { match($0, /[0-9]+%/); if (RSTART > 0) vol = substr($0, RSTART, RLENGTH-1) + 0 }
       /application\.name/            { split($0, a, "\""); if (length(a) > 1) name   = a[2] }
@@ -1854,6 +1974,19 @@ let
         os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
         "audio-mix-sync")
     OFFSETS = os.path.join(STATE_DIR, "offsets.json")
+
+    CONFIG = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "audio-mix", "config.json")
+
+    def mix_set_sources():
+        """The chosen mic subset for the blend. Empty = blend ALL mics
+        (back-compat with the pre-selection behaviour)."""
+        try:
+            with open(CONFIG) as f:
+                return set(json.load(f).get("sources") or [])
+        except Exception:
+            return set()
 
     RATE = 48000
     REC_S = 12           # calibration recording length
@@ -1996,6 +2129,9 @@ let
         def sync_wrappers(self):
             with self.lock:
                 mics = real_mics()
+                chosen = mix_set_sources()
+                if chosen:                         # non-empty = blend only these
+                    mics = [m for m in mics if m in chosen]
                 want = self.delays(mics)
                 for mic in list(self.wrappers):
                     p, d = self.wrappers[mic]
@@ -2052,6 +2188,13 @@ let
             if self.need_calibration():
                 threading.Thread(target=self.calibrate, daemon=True).start()
 
+        def on_setchange(self):
+            # SIGUSR1: the mix-set changed. Just re-sync which mics have
+            # wrappers (combined_mics follows delayed.*) — do NOT drop the
+            # hard-won calibration offsets the way reset() does.
+            self.sync_wrappers()
+            self.maybe_calibrate_async()
+
         def reset(self):
             with self.lock:
                 log("SIGHUP: dropping stored offsets, recalibrating")
@@ -2087,6 +2230,7 @@ let
     def main():
         d = Daemon()
         signal.signal(signal.SIGHUP, lambda *_: d.reset())
+        signal.signal(signal.SIGUSR1, lambda *_: d.on_setchange())
         try:
             d.run()
         finally:
@@ -2154,6 +2298,10 @@ let
     micblend-toggle-sh
     outdup-status-sh
     outdup-toggle-sh
+    outdup-reload-sh
+    mixset-read-sh
+    mixset-mutate-sh
+    mixset-slaves-sh
     usb-headroom-set-sh
     usb-headroom-status-sh
     audio-xrun-guard-sh
