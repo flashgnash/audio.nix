@@ -9,6 +9,29 @@ pipewire-screenaudio:
 
   security.rtkit.enable = true;
 
+  # Allow latency-sensitive audio HELPERS (not just PipeWire's own rtkit-managed
+  # threads) to obtain real-time scheduling, so a saturated CPU — a screen-cast
+  # encoder, share, game — can't starve them into stutter. The tailnet route's
+  # parec/gst capture is the motivating case: it must preempt the cast, not
+  # queue behind it. The helper requests a modest FIFO priority BELOW PipeWire's
+  # own; this only raises the ceiling (processes still run normally unless they
+  # explicitly ask for RT).
+  #   - loginLimits: interactive / graphical PAM sessions (terminal launches).
+  #   - systemd DefaultLimitRTPRIO: the route is usually launched from the
+  #     quickshell audio panel, i.e. under `systemd --user`, which does NOT get
+  #     pam_limits — the user@ manager's own ceiling must be raised for its
+  #     services (and their children) to go RT.
+  security.pam.loginLimits = [
+    {
+      domain = "@audio";
+      item = "rtprio";
+      type = "-";
+      value = "95";
+    }
+  ];
+  systemd.settings.Manager.DefaultLimitRTPRIO = 95;
+  systemd.user.extraConfig = "DefaultLimitRTPRIO=95";
+
   services.pulseaudio.enable = false;
 
   programs.noisetorch.enable = true;
@@ -102,9 +125,14 @@ pipewire-screenaudio:
                   # snd_aloop loopback device (piping played audio straight
                   # into the mic mix). The daemon wraps exactly the real
                   # usb/pci/bluez mics and time-aligns them.
-                  { "media.class" = "Audio/Source"; "node.name" = "~delayed\\..*"; }
+                  {
+                    "media.class" = "Audio/Source";
+                    "node.name" = "~delayed\\..*";
+                  }
                 ];
-                actions = { create-stream = { }; };
+                actions = {
+                  create-stream = { };
+                };
               }
             ];
           };
@@ -209,11 +237,26 @@ pipewire-screenaudio:
                 }
               ];
               links = [
-                { output = "hpf:Out"; input = "split:In"; }
-                { output = "split:Out"; input = "rnnoise:Input"; }
-                { output = "split:Out"; input = "mix:In 1"; }
-                { output = "rnnoise:Output"; input = "mix:In 2"; }
-                { output = "mix:Out"; input = "agc:Input"; }
+                {
+                  output = "hpf:Out";
+                  input = "split:In";
+                }
+                {
+                  output = "split:Out";
+                  input = "rnnoise:Input";
+                }
+                {
+                  output = "split:Out";
+                  input = "mix:In 1";
+                }
+                {
+                  output = "rnnoise:Output";
+                  input = "mix:In 2";
+                }
+                {
+                  output = "mix:Out";
+                  input = "agc:Input";
+                }
               ];
               inputs = [ "hpf:In" ];
               outputs = [ "agc:Output" ];
