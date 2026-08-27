@@ -49,6 +49,7 @@ pipewire-screenaudio:
     extraLadspaPackages = [
       pkgs.rnnoise-plugin.ladspa
       pkgs.ladspaPlugins # swh collection — sc4m compressor for the AGC stage
+      pkgs.lsp-plugins # autogain_mono (LUFS leveler) + limiter_mono (output cap)
     ];
 
     # RNNoise mic denoiser. Exposes ONE virtual source `rnnoise_source` that the
@@ -235,6 +236,41 @@ pipewire-screenaudio:
                     "Makeup gain (dB)" = 8.0;
                   };
                 }
+                {
+                  # Loudness leveler (LSP Autogain, LUFS-based). sc4m above evens
+                  # FAST near/far dynamics; this hits a SLOW integrated-loudness
+                  # target so the mic sits at the same perceived level as every
+                  # other source, without pumping. Because it normalises BEFORE
+                  # the source volume fader, the panel mic slider now reads as
+                  # "100% = matched target loudness, 150% = boosted above it".
+                  #
+                  # Starting tune — adjust via `rb` + listen (like the sc4m notes):
+                  #   Desired loudness  -20 LUFS  = the target everything converges to
+                  #   Silence floor     -50 LUFS  = below this it FREEZES the gain, so
+                  #                                 room/fan noise in your pauses is
+                  #                                 never amplified up (the anti-pump)
+                  #   Max amp +20 dB              = ceiling on boost (won't chase silence)
+                  #   Long grow/fall 6 dB, 700 ms = slow, smooth leveling (no jumping)
+                  #   Short grow 0 / fall 4       = allow a quick DUCK on a shout, but
+                  #                                 never a quick boost
+                  type = "ladspa";
+                  name = "lvl";
+                  plugin = "lsp-plugins-ladspa";
+                  label = "http://lsp-plug.in/plugins/ladspa/autogain_mono";
+                  control = {
+                    "Desired loudness level (LUFS)" = -20.0;
+                    "The level of silence (LUFS)" = -50.0;
+                    "Level drift (dB)" = 6.0;
+                    "Enable maximum amplification gain limitation" = 1.0;
+                    "The maximum amplification gain (dB)" = 20.0;
+                    "Loudness measuring long period (ms)" = 700.0;
+                    "Long gain grow amount" = 6.0;
+                    "Long gain fall amount" = 6.0;
+                    "Short gain grow amount" = 0.0;
+                    "Short gain fall amount" = 4.0;
+                    "Weighting function" = 5.0;
+                  };
+                }
               ];
               links = [
                 {
@@ -257,9 +293,13 @@ pipewire-screenaudio:
                   output = "mix:Out";
                   input = "agc:Input";
                 }
+                {
+                  output = "agc:Output";
+                  input = "lvl:Input";
+                }
               ];
               inputs = [ "hpf:In" ];
-              outputs = [ "agc:Output" ];
+              outputs = [ "lvl:Output" ];
             };
             "capture.props" = {
               "node.name" = "capture.rnnoise_source";
