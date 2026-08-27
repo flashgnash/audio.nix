@@ -146,7 +146,7 @@ let
       | head -1)
     if [ -n "$capid" ]; then
       t=$(${pkgs.pipewire}/bin/pw-metadata "$capid" target.object 2>/dev/null \
-        | awk -F"'" "/key:'target.object'/ { print \$4; exit }")
+        | ${pkgs.gawk}/bin/awk -F"'" "/key:'target.object'/ { print \$4; exit }")
       # Only trust the stored intent if that node still EXISTS. A mic that was
       # selected then removed (e.g. a disconnected network/USB mic) leaves stale
       # intent pointing at a dead node; trusting it blindly breaks the bar's
@@ -157,7 +157,7 @@ let
       fi
     fi
     # Fallback (no metadata yet, e.g. fresh boot): first live link.
-    ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | awk '
+    ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | ${pkgs.gawk}/bin/awk '
       /^capture\.rnnoise_source:input/ { f = 1; next }
       f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); sub(/:[^:]*$/, "", s); print s; exit }
       f && /^[^[:space:]]/ { f = 0 }
@@ -331,7 +331,7 @@ let
     # sync wrappers' 45 ms delay that's an audible echo, and it made every
     # link-order-based status reader flap. Anything not matching the new
     # target gets unlinked; WirePlumber re-adds the right one if we race it.
-    ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | awk -v want="$mic" '
+    ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | ${pkgs.gawk}/bin/awk -v want="$mic" '
       /^capture\.rnnoise_source:input/ { f = 1; next }
       f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); print s }
       f && /^[^[:space:]]/ { f = 0 }
@@ -1151,7 +1151,8 @@ let
                         and not n.endswith(".monitor")
                         and not n.startswith("delayed.")      # mix-sync wrappers
                         and not n.startswith("pw-loopback")
-                        and "platform-snd_aloop" not in n):   # guest plumbing
+                        and not n.startswith("tailnet-")       # network mic proxies
+                        and "platform-snd_aloop" not in n):   # (consume/donation) — never a VAD candidate; guest plumbing
                     names.append(n)
         return names
 
