@@ -278,16 +278,31 @@ let
   # chosen set has no present members (never build an empty combine sink).
   mixset-slaves-sh = pkgs.writeShellScriptBin "audio-mixset-slaves" ''
     cfg=${mixset-config-path}
+    # Remote tailnet outputs are stored as their mesh id (`mesh:output:host:name`);
+    # the audio-devices daemon keeps their route alive and writes the live proxy
+    # sink name here so we can fold it into the combine slaves.
+    proxymap="''${XDG_RUNTIME_DIR:-/tmp}/audio-mix/mesh-proxies"
     present=$(pactl list short sinks 2>/dev/null | awk '
       $2 != "combined_out" && $2 !~ /platform-snd_aloop/ { print $2 }')
-    chosen=""
-    [ -f "$cfg" ] && chosen=$(${pkgs.jq}/bin/jq -r '(.sinks // [])[]' "$cfg" 2>/dev/null)
     slaves=""
-    if [ -n "$chosen" ]; then
-      for s in $chosen; do
-        printf '%s\n' "$present" | grep -qxF "$s" && slaves="$slaves''${slaves:+,}$s"
-      done
-    fi
+    # Iterate line-by-line: mesh ids embed spaces (device names), so word-splitting
+    # would shred them.
+    while IFS= read -r s; do
+      [ -z "$s" ] && continue
+      case "$s" in
+        mesh:*)
+          px=""
+          [ -f "$proxymap" ] && px=$(${pkgs.gawk}/bin/awk -F'\t' -v k="$s" \
+            '$1 == k { print $2; exit }' "$proxymap" 2>/dev/null)
+          [ -n "$px" ] && printf '%s\n' "$present" | grep -qxF "$px" \
+            && slaves="$slaves''${slaves:+,}$px" ;;
+        *)
+          printf '%s\n' "$present" | grep -qxF "$s" \
+            && slaves="$slaves''${slaves:+,}$s" ;;
+      esac
+    done <<EOF
+$([ -f "$cfg" ] && ${pkgs.jq}/bin/jq -r '(.sinks // [])[]' "$cfg" 2>/dev/null)
+EOF
     [ -z "$slaves" ] && slaves=$(printf '%s\n' "$present" | ${pkgs.coreutils}/bin/paste -sd,)
     printf '%s\n' "$slaves"
   '';
@@ -1820,7 +1835,16 @@ let
       if [ "$kind" = src ]; then
         ${pkgs.procps}/bin/pkill -USR1 -f mix-sync-daemon.py 2>/dev/null || true
       else
-        ${outdup-reload-sh}/bin/audio-outdup-reload 2>/dev/null || true
+        case "$name" in
+          mesh:*)
+            # Remote tailnet output: the audio-devices daemon owns the route
+            # lifecycle (start/keep-alive), the proxy map, AND the combined_out
+            # rebuild once the proxy exists. Poke it to reconcile now; it reloads
+            # the combine itself, so we don't double-reload here.
+            ${pkgs.procps}/bin/pkill -USR1 -f audio_devices.py 2>/dev/null || true ;;
+          *)
+            ${outdup-reload-sh}/bin/audio-outdup-reload 2>/dev/null || true ;;
+        esac
       fi
     fi
     echo done
