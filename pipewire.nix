@@ -315,6 +315,112 @@ pipewire-screenaudio:
         }
       ];
     };
+
+    # ── Per-app OUTPUT balancing: a fixed pool of leveler+limiter sinks ──────
+    # A STATIC pool of filter-chain sinks `applvl.0..applvl.N-1`. The
+    # audio-balance daemon (flakes/audio/balance_daemon.py) parks a running app
+    # on a free slot by MOVING its sink-inputs here (reversible, never creates
+    # graph nodes — so it can't wedge the graph); the chain LUFS-levels that app
+    # to a common target and brick-wall limits transients before handing off to
+    # the real default sink. Idle slots have no client and PipeWire suspends them
+    # (≈free). Everything stays 32-bit float end to end and the limiter caps the
+    # peak, so the one float->int conversion at the DAC can't clip — transparent.
+    #
+    # These are internal plumbing: the audio-devices LocalModule masks `applvl.*`
+    # so they never appear as user-selectable outputs.
+    #
+    # Tuning (adjust via rb + listen, like the mic sc4m/autogain notes):
+    #   target -18 LUFS, silence floor -60 (freeze gain in near-silence, no pump),
+    #   max amp +12 dB (don't lift a quiet app's noise floor), 1 s long period
+    #   (slow, smooth), fall (6) faster than grow (4) so a spike ducks quickly but
+    #   a return to normal eases back up; limiter ceiling -1 dBFS (0.891).
+    extraConfig.pipewire."99-app-balance" = {
+      "context.modules" = builtins.genList (i: {
+        name = "libpipewire-module-filter-chain";
+        # nofail: a plugin load failure must never take down PipeWire.
+        flags = [ "nofail" ];
+        args = {
+          "node.description" = "App Balance ${toString i}";
+          "media.name" = "App Balance ${toString i}";
+          "filter.graph" = {
+            nodes = [
+              {
+                type = "ladspa";
+                name = "lvl";
+                plugin = "lsp-plugins-ladspa";
+                label = "http://lsp-plug.in/plugins/ladspa/autogain_stereo";
+                control = {
+                  "Desired loudness level (LUFS)" = -18.0;
+                  "The level of silence (LUFS)" = -60.0;
+                  "Level drift (dB)" = 6.0;
+                  "Enable maximum amplification gain limitation" = 1.0;
+                  "The maximum amplification gain (dB)" = 12.0;
+                  "Loudness measuring long period (ms)" = 1000.0;
+                  "Long gain grow amount" = 4.0;
+                  "Long gain fall amount" = 6.0;
+                  "Short gain grow amount" = 0.0;
+                  "Short gain fall amount" = 6.0;
+                  "Weighting function" = 5.0;
+                };
+              }
+              {
+                type = "ladspa";
+                name = "lim";
+                plugin = "lsp-plugins-ladspa";
+                label = "http://lsp-plug.in/plugins/ladspa/limiter_stereo";
+                control = {
+                  # -1 dBFS ceiling: 10^(-1/20) ≈ 0.891 (linear).
+                  "Threshold (G)" = 0.891;
+                  "Attack time (ms)" = 1.0;
+                  "Release time (ms)" = 8.0;
+                };
+              }
+            ];
+            links = [
+              {
+                output = "lvl:Output L";
+                input = "lim:Input L";
+              }
+              {
+                output = "lvl:Output R";
+                input = "lim:Input R";
+              }
+            ];
+            inputs = [
+              "lvl:Input L"
+              "lvl:Input R"
+            ];
+            outputs = [
+              "lim:Output L"
+              "lim:Output R"
+            ];
+          };
+          "capture.props" = {
+            "node.name" = "applvl.${toString i}";
+            "node.description" = "App Balance ${toString i}";
+            "media.class" = "Audio/Sink";
+            "audio.rate" = 48000;
+            "audio.position" = [
+              "FL"
+              "FR"
+            ];
+          };
+          "playback.props" = {
+            "node.name" = "applvl.${toString i}.out";
+            "audio.rate" = 48000;
+            "audio.position" = [
+              "FL"
+              "FR"
+            ];
+            # NOT passive: match the canonical "sink with filter" pattern so the
+            # slot reliably drives the real sink when an app is parked on it. An
+            # idle slot has no client feeding it, so PipeWire auto-suspends it
+            # anyway (≈free) — passive here risked the driver-starvation the
+            # static combine-sinks hit.
+          };
+        };
+      }) 4;
+    };
   };
 
   environment.systemPackages = with pkgs; [

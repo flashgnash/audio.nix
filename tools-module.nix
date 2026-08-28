@@ -14,9 +14,11 @@ let
   cfg = config.programs.audioctl;
 in
 {
-  options.programs.audioctl.enable = lib.mkEnableOption "audio backend tools (audioctl + daemons)" // {
-    default = true;
-  };
+  options.programs.audioctl.enable =
+    lib.mkEnableOption "audio backend tools (audioctl + daemons)"
+    // {
+      default = true;
+    };
 
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ tools.audio-tools ];
@@ -55,6 +57,30 @@ in
       unitConfig.StartLimitIntervalSec = 0;
       serviceConfig = {
         ExecStart = "${tools.mix-sync-daemon-sh}/bin/audio-mix-sync-daemon";
+        Restart = "always";
+        RestartSec = "3s";
+      };
+    };
+
+    # Per-app output balancing daemon. Idle (assigns nothing) until the config
+    # at ~/.config/audio-balance/config.json enables it. It only MOVES app
+    # sink-inputs onto the static applvl.* filter-chain pool (declared in
+    # pipewire.nix) — never creates graph nodes — so it can't wedge the graph.
+    systemd.user.services.audio-balance = {
+      description = "Per-app output loudness balancing (leveler + limiter)";
+      after = [
+        "graphical-session.target"
+        "pipewire.service"
+        "wireplumber.service"
+        "pipewire-pulse.service"
+      ];
+      partOf = [ "graphical-session.target" ];
+      wantedBy = [ "graphical-session.target" ];
+      # If pipewire-pulse isn't up yet `pactl subscribe` fails and the daemon
+      # exits; restart unconditionally rather than trip the start limit.
+      unitConfig.StartLimitIntervalSec = 0;
+      serviceConfig = {
+        ExecStart = "${tools.balance-daemon-sh}/bin/audio-balance-daemon";
         Restart = "always";
         RestartSec = "3s";
       };

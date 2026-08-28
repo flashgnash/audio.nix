@@ -277,34 +277,34 @@ let
   # every present sink minus the snd_aloop loopback. Falls back to all if the
   # chosen set has no present members (never build an empty combine sink).
   mixset-slaves-sh = pkgs.writeShellScriptBin "audio-mixset-slaves" ''
-    cfg=${mixset-config-path}
-    # Remote tailnet outputs are stored as their mesh id (`mesh:output:host:name`);
-    # the audio-devices daemon keeps their route alive and writes the live proxy
-    # sink name here so we can fold it into the combine slaves.
-    proxymap="''${XDG_RUNTIME_DIR:-/tmp}/audio-mix/mesh-proxies"
-    present=$(pactl list short sinks 2>/dev/null | awk '
-      $2 != "combined_out" && $2 !~ /platform-snd_aloop/ { print $2 }')
-    slaves=""
-    # Iterate line-by-line: mesh ids embed spaces (device names), so word-splitting
-    # would shred them.
-    while IFS= read -r s; do
-      [ -z "$s" ] && continue
-      case "$s" in
-        mesh:*)
-          px=""
-          [ -f "$proxymap" ] && px=$(${pkgs.gawk}/bin/awk -F'\t' -v k="$s" \
-            '$1 == k { print $2; exit }' "$proxymap" 2>/dev/null)
-          [ -n "$px" ] && printf '%s\n' "$present" | grep -qxF "$px" \
-            && slaves="$slaves''${slaves:+,}$px" ;;
-        *)
-          printf '%s\n' "$present" | grep -qxF "$s" \
-            && slaves="$slaves''${slaves:+,}$s" ;;
-      esac
-    done <<EOF
-$([ -f "$cfg" ] && ${pkgs.jq}/bin/jq -r '(.sinks // [])[]' "$cfg" 2>/dev/null)
-EOF
-    [ -z "$slaves" ] && slaves=$(printf '%s\n' "$present" | ${pkgs.coreutils}/bin/paste -sd,)
-    printf '%s\n' "$slaves"
+        cfg=${mixset-config-path}
+        # Remote tailnet outputs are stored as their mesh id (`mesh:output:host:name`);
+        # the audio-devices daemon keeps their route alive and writes the live proxy
+        # sink name here so we can fold it into the combine slaves.
+        proxymap="''${XDG_RUNTIME_DIR:-/tmp}/audio-mix/mesh-proxies"
+        present=$(pactl list short sinks 2>/dev/null | awk '
+          $2 != "combined_out" && $2 !~ /platform-snd_aloop/ { print $2 }')
+        slaves=""
+        # Iterate line-by-line: mesh ids embed spaces (device names), so word-splitting
+        # would shred them.
+        while IFS= read -r s; do
+          [ -z "$s" ] && continue
+          case "$s" in
+            mesh:*)
+              px=""
+              [ -f "$proxymap" ] && px=$(${pkgs.gawk}/bin/awk -F'\t' -v k="$s" \
+                '$1 == k { print $2; exit }' "$proxymap" 2>/dev/null)
+              [ -n "$px" ] && printf '%s\n' "$present" | grep -qxF "$px" \
+                && slaves="$slaves''${slaves:+,}$px" ;;
+            *)
+              printf '%s\n' "$present" | grep -qxF "$s" \
+                && slaves="$slaves''${slaves:+,}$s" ;;
+          esac
+        done <<EOF
+    $([ -f "$cfg" ] && ${pkgs.jq}/bin/jq -r '(.sinks // [])[]' "$cfg" 2>/dev/null)
+    EOF
+        [ -z "$slaves" ] && slaves=$(printf '%s\n' "$present" | ${pkgs.coreutils}/bin/paste -sd,)
+        printf '%s\n' "$slaves"
   '';
 
   # Rebuild combined_out with the current mix-set slaves — but only if the
@@ -1921,7 +1921,9 @@ EOF
       # sink the MIX toggle loads on demand) are not apps — they get their
       # own rows in the dup-sink mixer of the popup instead.
       function emit() {
-        if (id == "" || nodename ~ /^output\.combined_out/) return
+        # applvl.<n>.out are the balance-pool bridge streams (see balance_daemon),
+        # not apps — hide them or they show as phantom "Unknown" gauges.
+        if (id == "" || nodename ~ /^output\.combined_out/ || nodename ~ /^applvl\./) return
         title = (pid in titles) ? titles[pid] : ""
         if (pid in enames) name = enames[pid]
         printf "%s|%s|%s|%s|%s|%s|%s\n", id, name, vol, muted, binary, corked, title
@@ -2302,7 +2304,103 @@ EOF
     esac
   '';
 
+  # ── Per-app OUTPUT balancing (loudness leveler + spike limiter) ─────────────
+  # The daemon parks each running app on a free slot of the STATIC filter-chain
+  # pool declared in pipewire.nix (applvl.0..N-1) by moving its sink-inputs, and
+  # publishes the applied per-app gain for the bar. See balance_daemon.py.
+  balance-config-path = ''"''${XDG_CONFIG_HOME:-$HOME/.config}/audio-balance/config.json"'';
+
+  balance-daemon-py = pkgs.writeText "balance-daemon.py" (builtins.readFile ./balance_daemon.py);
+
+  balance-daemon-sh = pkgs.writeShellScriptBin "audio-balance-daemon" ''
+    export PACTL=${pkgs.pulseaudio}/bin/pactl
+    export PW_DUMP=${pkgs.pipewire}/bin/pw-dump
+    export PAREC=${pkgs.pulseaudio}/bin/parec
+    exec ${pkgs.python3}/bin/python ${balance-daemon-py} daemon
+  '';
+
+  # Emit balancing state as parseable lines:  output|<0|1>   input|<0|1>
+  balance-read-sh = pkgs.writeShellScriptBin "audio-balance-read" ''
+    cfg=${balance-config-path}
+    if [ -f "$cfg" ]; then
+      ${pkgs.jq}/bin/jq -r '
+        "output|" + (if .output_enabled then "1" else "0" end),
+        "input|"  + (if .input_enabled  then "1" else "0" end)
+      ' "$cfg" 2>/dev/null || { echo "output|0"; echo "input|0"; }
+    else
+      echo "output|0"; echo "input|0"
+    fi
+    exit 0
+  '';
+
+  # Live applied gains from the daemon's balance.json, as parseable lines:
+  #   out|<gain%>|<sink-input#>,<sink-input#>,...     in|<gain%>|<mic node.name>
+  balance-gains-sh = pkgs.writeShellScriptBin "audio-balance-gains" ''
+    state="''${XDG_STATE_HOME:-$HOME/.local/state}/qs-audio/balance.json"
+    [ -f "$state" ] || exit 0
+    ${pkgs.jq}/bin/jq -r '
+      (.output[]? | "out|\(.gain)|\(.offset // 100)|" + ((.ids // []) | map(tostring) | join(","))),
+      (.input[]?  | "in|\(.gain)|\(.key)")
+    ' "$state" 2>/dev/null
+    exit 0
+  '';
+
+  # Toggle balancing per side:  audio-balance-mutate <output|input> <toggle|1|0>
+  balance-mutate-sh = pkgs.writeShellScriptBin "audio-balance-mutate" ''
+    cfg=${balance-config-path}
+    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$cfg")"
+    [ -f "$cfg" ] || echo '{"output_enabled":false,"input_enabled":false}' > "$cfg"
+    side="$1"; cmd="$2"
+    case "$side" in
+      output) key=output_enabled ;;
+      input)  key=input_enabled ;;
+      *) echo "bad side: $side" >&2; exit 1 ;;
+    esac
+    jq=${pkgs.jq}/bin/jq
+    tmp=$(${pkgs.coreutils}/bin/mktemp)
+    case "$cmd" in
+      toggle) "$jq" --arg k "$key" '.[$k] = ((.[$k] // false) | not)' "$cfg" > "$tmp" ;;
+      1) "$jq" --arg k "$key" '.[$k] = true'  "$cfg" > "$tmp" ;;
+      0) "$jq" --arg k "$key" '.[$k] = false' "$cfg" > "$tmp" ;;
+      *) ${pkgs.coreutils}/bin/rm -f "$tmp"; echo "unknown command: $cmd" >&2; exit 1 ;;
+    esac
+    if [ -s "$tmp" ]; then ${pkgs.coreutils}/bin/mv "$tmp" "$cfg"; else ${pkgs.coreutils}/bin/rm -f "$tmp"; fi
+    # Nudge the daemon to re-read config + reconcile now (event-driven).
+    ${pkgs.procps}/bin/pkill -HUP -f balance-daemon.py 2>/dev/null || true
+    echo done
+  '';
+
+  # Post-leveler per-app trim:  audio-balance-setvol <sink-input-id> <pct>
+  # The gauge calls this when output balancing is ON. It sets the volume of the
+  # slot's playback bridge (applvl.<n>.out), which is applied AFTER the leveler,
+  # so the trim sticks instead of being normalised away. No-op if the stream is
+  # not currently on a balance slot.
+  balance-setvol-sh = pkgs.writeShellScriptBin "audio-balance-setvol" ''
+    PATH=${pkgs.pulseaudio}/bin:${pkgs.gawk}/bin:$PATH
+    id="$1"; pct="$2"
+    [ -z "$id" ] || [ -z "$pct" ] && exit 1
+    # which sink INDEX is this stream on?
+    sidx=$(pactl list sink-inputs | awk -v want="$id" '
+      /^Sink Input #/ { cur=substr($3,2) }
+      /^\tSink:/      { if (cur==want) { print $2; exit } }')
+    [ -z "$sidx" ] && exit 0
+    # index -> name; must be a balance slot
+    slot=$(pactl list short sinks | awk -v i="$sidx" '$1==i {print $2}')
+    case "$slot" in applvl.*) ;; *) exit 0 ;; esac
+    # find the applvl.<n>.out bridge sink-input and set its volume
+    outid=$(pactl list sink-inputs | awk -v n="$slot.out" '
+      /^Sink Input #/ { cur=substr($3,2) }
+      /node\.name = / { if (index($0, "\"" n "\"")) { print cur; exit } }')
+    [ -n "$outid" ] && pactl set-sink-input-volume "$outid" "$pct%"
+    echo done
+  '';
+
   tools = [
+    balance-daemon-sh
+    balance-read-sh
+    balance-gains-sh
+    balance-mutate-sh
+    balance-setvol-sh
     bt-audio-connect-sh
     recency-sh
     default-sink-kind-sh
@@ -2364,6 +2462,7 @@ rec {
     audio-xrun-guard-sh
     auto-mic-daemon-sh
     mix-sync-daemon-sh
+    balance-daemon-sh
     ;
 
   # Everything on PATH: audio-* tools + the audioctl dispatcher.
