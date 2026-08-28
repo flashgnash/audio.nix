@@ -44,14 +44,10 @@ PACTL = os.environ.get("PACTL", "pactl")
 PW_DUMP = os.environ.get("PW_DUMP", "pw-dump")
 PAREC = os.environ.get("PAREC", "parec")
 
-# OUTPUT arc reconstruction. The autogain plugin's applied-gain meter port is NOT
-# exposed by PipeWire filter-chains, so we can't read it directly. Instead we
-# measure each slot's PRE-filter input loudness (the sink monitor taps before the
-# graph) and reconstruct the makeup gain the leveler applies to reach target —
-# same target/limits as the filter (see pipewire.nix 99-app-balance). This drives
-# the blue "adjustment" arc and confirms leveling is actually happening.
-OUTPUT_TARGET_LUFS = -18.0   # must match the filter's "Desired loudness level"
-OUTPUT_MAX_AMP_DB = 12.0     # must match the filter's "maximum amplification gain"
+# OUTPUT arc display clamps. The applied gain is MEASURED per slot (post-filter
+# loudness minus pre-filter loudness — see the reader pair below); these only
+# bound what the blue arc shows against measurement noise.
+OUTPUT_MAX_AMP_DB = 18.0     # plugin max amp is +12; headroom for meter noise
 OUTPUT_MIN_GAIN_DB = -24.0   # how far we show attenuation of loud streams
 
 CONFIG = os.path.join(
@@ -63,6 +59,12 @@ STATE_DIR = os.path.join(
     "qs-audio",
 )
 STATE_FILE = os.path.join(STATE_DIR, "balance.json")
+# Persistent per-APP post-leveler trims ({app key: pct}). These are the user's
+# gauge settings WHILE balancing is on (the applvl.<n>.out bridge volume) —
+# deliberately separate from the apps' own sink-input volumes, which the
+# balancer never touches. Restored whenever the app lands on a slot, so trims
+# survive daemon/PipeWire restarts and slot reshuffles.
+TRIMS_FILE = os.path.join(STATE_DIR, "balance-trims.json")
 
 # Must match the pool size declared in flakes/audio/pipewire.nix (99-app-balance).
 NSLOTS = int(os.environ.get("BALANCE_SLOTS", "4"))
@@ -167,33 +169,36 @@ def app_key(si):
 
 
 # ------------------------------------------------------------------- gain readout
-# slot node.name -> reconstructed applied gain (percent, 100 = unity). Maintained
-# by output_gain_loop (measures the slot's pre-filter monitor loudness); read by
-# reconcile when it builds the published rows.
+# slot node.name -> MEASURED applied gain (percent, 100 = unity). Maintained by
+# output_gain_loop; read by reconcile when it builds the published rows.
 _slot_gain = {}
-_slot_gain_db = {}           # slot -> reconstructed gain in dB (for the arc)
+_slot_gain_db = {}           # slot -> measured gain in dB (for the arc)
 # Auto-calibrated display range (dB) for the UI arcs: expands instantly to
 # include any observed gain, relaxes slowly (0.05 dB/s) so stale extremes fade.
 _rng = {"lo": None, "hi": None}
 _slot_gain_lock = threading.Lock()
 
 
-# Persistent per-slot monitor readers. CRITICAL: we do NOT re-open a parec per
-# measurement — repeatedly opening/closing a capture on a filter-chain sink's
-# monitor forces the graph to reconfigure and produces xruns/crackle. Instead one
-# steady capture per active slot maintains an EMA of that slot's PRE-filter input
-# loudness (the monitor taps before the filter graph), from which the applied gain
-# is reconstructed for the arc.
-_slot_db = {}                # slot -> latest EMA dBFS (or None when silent)
+# Persistent per-slot readers, a PAIR per active slot. CRITICAL: we do NOT
+# re-open a parec per measurement — repeatedly opening/closing a capture on a
+# filter-chain sink's monitor forces the graph to reconfigure and produces
+# xruns/crackle. Each pair maintains an EMA of:
+#   pre:  the slot sink's monitor       = the app's signal BEFORE the leveler
+#   post: --monitor-stream on the slot's '<slot>.out' playback bridge
+#         = the signal AFTER the leveler+limiter (pre user trim — verified:
+#           the stream monitor taps the raw stream data, not post-volume)
+# so applied gain = post − pre, the plugin's REAL behaviour. The old approach
+# (reconstruct target − pre-RMS) was fiction: RMS dBFS ≠ K-weighted LUFS, so
+# the arc railed at the +12 dB clamp while the plugin was actually attenuating.
+_slot_db = {}                # slot -> pre-filter EMA dBFS (None when silent)
+_slot_db_out = {}            # slot -> post-filter EMA dBFS (None when silent)
 _slot_readers = {}           # slot -> stop Event
 
 
-def _monitor_reader(slot, stop):
+def _ema_reader(cmd, store, key, stop):
+    """Feed store[key] with a gated RMS EMA of a raw float32 mono capture."""
     try:
-        p = subprocess.Popen(
-            [PAREC, "-d", slot + ".monitor", "--format=float32le",
-             "--channels=1", "--rate=48000", "--raw"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except Exception:
         return
     block = int(48000 * 4 * 0.2)          # 0.2 s blocks
@@ -212,20 +217,55 @@ def _monitor_reader(slot, stop):
                 s += v * v
             rms = math.sqrt(s / len(a))
             # Gate at -60 dBFS to match the leveler plugin's "level of silence"
-            # (it freezes its gain there): quiet passages must not drag the EMA
-            # down, or the reconstructed gain rails at the +12 dB clamp.
+            # (it freezes its gain there): quiet passages must not skew the EMA.
             if rms <= 1e-3:
-                _slot_db[slot] = None
+                store[key] = None
             else:
                 db = 20.0 * math.log10(rms)
                 ema = db if ema is None else (0.7 * ema + 0.3 * db)
-                _slot_db[slot] = ema
+                store[key] = ema
     finally:
         try:
             p.kill()
         except Exception:
             pass
-        _slot_db.pop(slot, None)
+        store.pop(key, None)
+
+
+def _monitor_reader(slot, stop):
+    _ema_reader([PAREC, "-d", slot + ".monitor", "--format=float32le",
+                 "--channels=1", "--rate=48000", "--raw"],
+                _slot_db, slot, stop)
+
+
+def _out_reader(slot, out_id, stop):
+    _ema_reader([PAREC, "--monitor-stream=%s" % out_id, "--format=float32le",
+                 "--channels=1", "--rate=48000", "--raw"],
+                _slot_db_out, slot, stop)
+
+
+# ------------------------------------------------------------------- trims
+_trims = {}
+
+
+def _load_trims():
+    global _trims
+    try:
+        with open(TRIMS_FILE) as f:
+            _trims = {str(k): int(v) for k, v in json.load(f).items()}
+    except Exception:
+        _trims = {}
+
+
+def _save_trims():
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = TRIMS_FILE + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump(_trims, f)
+        os.replace(tmp, TRIMS_FILE)
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------- state file
@@ -375,6 +415,7 @@ def _reconcile_locked():
                 _slot_gain.pop(slot, None)
                 _slot_gain_db.pop(slot, None)
     out_ids = _applvl_out_ids()
+    trims_dirty = False
     for slot, sid in _assign.items():
         si = streams_by_id.get(sid)
         if not si:
@@ -382,20 +423,31 @@ def _reconcile_locked():
         cur = sink_name.get(si.get("sink_index", ""), "")
         if cur != slot:
             _move(si["id"], slot)
-        # New stream on this slot? Reset its post-leveler trim to matched (100%),
-        # so it never inherits the previous stream's offset.
+        key = (si.get("appname") or si.get("node_name") or si.get("binary") or "app")
+        # New stream on this slot? Apply the APP's saved post-leveler trim (so
+        # trims survive restarts / reassignment) rather than inheriting the
+        # previous stream's offset. Unknown apps start matched (100%).
         if _slot_stream.get(slot) != sid:
             _slot_stream[slot] = sid
-            _set_out_vol(slot, 100, out_ids)
-            offset = 100
+            offset = _trims.get(key, 100)
+            _set_out_vol(slot, offset, out_ids)
         else:
             offset = _get_sinkinput_vol(out_ids.get(slot)) if slot in out_ids else 100
             if offset is None:
                 offset = 100
-        key = (si.get("appname") or si.get("node_name") or si.get("binary") or "app")
+            # The gauge drives this volume directly (audio-balance-setvol);
+            # persist what we observe, per app. 100 = default, don't store.
+            if offset != _trims.get(key, 100):
+                if offset == 100:
+                    _trims.pop(key, None)
+                else:
+                    _trims[key] = offset
+                trims_dirty = True
         rows.append({"key": key, "ids": [int(sid)], "gain": gains.get(slot, 100),
                      "gain_db": round(gains_db.get(slot, 0.0), 1),
                      "offset": offset, "slot": slot})
+    if trims_dirty:
+        _save_trims()
     # Forget stream-tracking for freed slots.
     for slot in list(_slot_stream.keys()):
         if slot not in _assign:
@@ -410,23 +462,29 @@ def output_gain_loop():
     while True:
         cfg = load_config()
         active = set(_assign.keys()) if cfg["output_enabled"] else set()
-        # start readers for newly-active slots
-        for slot in active - set(_slot_readers):
+        # start reader pairs for newly-active slots
+        newly = active - set(_slot_readers)
+        out_ids = _applvl_out_ids() if newly else {}
+        for slot in newly:
             stop = threading.Event()
             _slot_readers[slot] = stop
             threading.Thread(target=_monitor_reader, args=(slot, stop),
                              daemon=True).start()
+            if slot in out_ids:
+                threading.Thread(target=_out_reader, args=(slot, out_ids[slot], stop),
+                                 daemon=True).start()
         # stop readers for slots no longer active
         for slot in set(_slot_readers) - active:
             _slot_readers.pop(slot).set()
-        # reconstruct gain from the readers' EMA loudness
+        # measured gain = post-filter loudness − pre-filter loudness
         changed = False
         cur = []
         for slot in active:
             db = _slot_db.get(slot)
-            if db is None:
+            db_out = _slot_db_out.get(slot)
+            if db is None or db_out is None:
                 continue
-            g_db = OUTPUT_TARGET_LUFS - db
+            g_db = db_out - db
             g_db = max(OUTPUT_MIN_GAIN_DB, min(OUTPUT_MAX_AMP_DB, g_db))
             cur.append(g_db)
             g = int(round(100.0 * (10.0 ** (g_db / 20.0))))
@@ -483,6 +541,7 @@ def _publish():
 
 # ------------------------------------------------------------------- daemon
 def cmd_daemon(_args):
+    _load_trims()
     wake = threading.Event()
 
     def sub():

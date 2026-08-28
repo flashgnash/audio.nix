@@ -247,8 +247,11 @@ pipewire-screenaudio:
     # Tuning (adjust via rb + listen):
     #   target -18 LUFS, silence floor -60 (freeze gain in near-silence, no pump),
     #   max amp +12 dB (don't lift a quiet app's noise floor), 1 s long period
-    #   (slow, smooth), fall (6) faster than grow (4) so a spike ducks quickly but
-    #   a return to normal eases back up; limiter ceiling -1 dBFS (0.891).
+    #   (slow, smooth), long grow/fall 4 (symmetric, ~12.6 dB/s) so leveling
+    #   drifts rather than flinches; BOTH short paths disabled (2026-08-28: the
+    #   short fall at 6 dB per ~9 ms gutted transients mid-bang — "loud sounds
+    #   get neutered" — and the limiter below already catches true spikes);
+    #   limiter ceiling -1 dBFS (0.891).
     extraConfig.pipewire."99-app-balance" = {
       "context.modules" = builtins.genList (i: {
         name = "libpipewire-module-filter-chain";
@@ -272,9 +275,9 @@ pipewire-screenaudio:
                   "The maximum amplification gain (dB)" = 12.0;
                   "Loudness measuring long period (ms)" = 1000.0;
                   "Long gain grow amount" = 4.0;
-                  "Long gain fall amount" = 6.0;
+                  "Long gain fall amount" = 4.0;
                   "Short gain grow amount" = 0.0;
-                  "Short gain fall amount" = 6.0;
+                  "Short gain fall amount" = 0.0;
                   "Weighting function" = 5.0;
                 };
               }
