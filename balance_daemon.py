@@ -44,10 +44,6 @@ PACTL = os.environ.get("PACTL", "pactl")
 PW_DUMP = os.environ.get("PW_DUMP", "pw-dump")
 PAREC = os.environ.get("PAREC", "parec")
 
-# INPUT balancing target — each physical mic is nudged toward this integrated
-# level so several mics in a blend arrive at matching loudness.
-INPUT_TARGET_DBFS = -20.0
-
 # OUTPUT arc reconstruction. The autogain plugin's applied-gain meter port is NOT
 # exposed by PipeWire filter-chains, so we can't read it directly. Instead we
 # measure each slot's PRE-filter input loudness (the sink monitor taps before the
@@ -175,6 +171,10 @@ def app_key(si):
 # by output_gain_loop (measures the slot's pre-filter monitor loudness); read by
 # reconcile when it builds the published rows.
 _slot_gain = {}
+_slot_gain_db = {}           # slot -> reconstructed gain in dB (for the arc)
+# Auto-calibrated display range (dB) for the UI arcs: expands instantly to
+# include any observed gain, relaxes slowly (0.05 dB/s) so stale extremes fade.
+_rng = {"lo": None, "hi": None}
 _slot_gain_lock = threading.Lock()
 
 
@@ -211,7 +211,10 @@ def _monitor_reader(slot, stop):
             for v in a:
                 s += v * v
             rms = math.sqrt(s / len(a))
-            if rms <= 1e-6:
+            # Gate at -60 dBFS to match the leveler plugin's "level of silence"
+            # (it freezes its gain there): quiet passages must not drag the EMA
+            # down, or the reconstructed gain rails at the +12 dB clamp.
+            if rms <= 1e-3:
                 _slot_db[slot] = None
             else:
                 db = 20.0 * math.log10(rms)
@@ -240,7 +243,9 @@ _assign = {}
 _recon_lock = threading.Lock()
 _last_published = None
 _publish_lock = threading.Lock()
-# Rows published for each side (maintained by output reconcile + input loop).
+# Rows published by the output reconcile. Input (per-mic capture-volume)
+# balancing was removed 2026-08-28 — it fought the user's mic levels; the
+# "input" key stays as [] for frontend compat.
 _output_rows = []
 _input_rows = []
 
@@ -361,12 +366,14 @@ def _reconcile_locked():
     rows = []
     with _slot_gain_lock:
         gains = dict(_slot_gain)
+        gains_db = dict(_slot_gain_db)
     # Forget cached gains for slots no longer assigned (so a freed slot doesn't
     # keep a stale value if it's reused).
     for slot in list(_slot_gain.keys()):
         if slot not in _assign:
             with _slot_gain_lock:
                 _slot_gain.pop(slot, None)
+                _slot_gain_db.pop(slot, None)
     out_ids = _applvl_out_ids()
     for slot, sid in _assign.items():
         si = streams_by_id.get(sid)
@@ -387,7 +394,8 @@ def _reconcile_locked():
                 offset = 100
         key = (si.get("appname") or si.get("node_name") or si.get("binary") or "app")
         rows.append({"key": key, "ids": [int(sid)], "gain": gains.get(slot, 100),
-                     "offset": offset})
+                     "gain_db": round(gains_db.get(slot, 0.0), 1),
+                     "offset": offset, "slot": slot})
     # Forget stream-tracking for freed slots.
     for slot in list(_slot_stream.keys()):
         if slot not in _assign:
@@ -413,19 +421,37 @@ def output_gain_loop():
             _slot_readers.pop(slot).set()
         # reconstruct gain from the readers' EMA loudness
         changed = False
+        cur = []
         for slot in active:
             db = _slot_db.get(slot)
             if db is None:
                 continue
             g_db = OUTPUT_TARGET_LUFS - db
             g_db = max(OUTPUT_MIN_GAIN_DB, min(OUTPUT_MAX_AMP_DB, g_db))
+            cur.append(g_db)
             g = int(round(100.0 * (10.0 ** (g_db / 20.0))))
             with _slot_gain_lock:
+                _slot_gain_db[slot] = g_db
                 if _slot_gain.get(slot) != g:
                     _slot_gain[slot] = g
                     changed = True
+        # auto-calibrate the arc display range from observed gains
+        rng_moved = False
+        if cur:
+            lo, hi = min(cur), max(cur)
+            with _slot_gain_lock:
+                old = (_rng["lo"], _rng["hi"])
+                if _rng["lo"] is None:
+                    _rng["lo"], _rng["hi"] = lo, hi
+                else:
+                    _rng["lo"] = min(lo, _rng["lo"] + 0.05)
+                    _rng["hi"] = max(hi, _rng["hi"] - 0.05)
+                rng_moved = (round(old[0] or 0, 1), round(old[1] or 0, 1)) != \
+                            (round(_rng["lo"], 1), round(_rng["hi"], 1))
         if changed:
             reconcile()
+        elif rng_moved:
+            _publish()
         time.sleep(1.0)
 
 
@@ -435,146 +461,24 @@ def _set_output_rows(rows):
     _publish()
 
 
-def _set_input_rows(rows):
-    global _input_rows
-    _input_rows = rows
-    _publish()
-
-
 def _publish():
     global _last_published
+    with _slot_gain_lock:
+        lo, hi = _rng["lo"], _rng["hi"]
+    if lo is None:
+        rng = None
+    else:
+        # pad to a minimum 3 dB span so a lone / steady app sits mid-arc
+        # instead of railing at an end of a zero-width range
+        if hi - lo < 3.0:
+            pad = (3.0 - (hi - lo)) / 2.0
+            lo, hi = lo - pad, hi + pad
+        rng = {"lo": round(lo, 1), "hi": round(hi, 1)}
     with _publish_lock:
-        obj = {"output": _output_rows, "input": _input_rows}
+        obj = {"output": _output_rows, "input": _input_rows, "range": rng}
         if obj != _last_published:
             _last_published = obj
             _atomic_write(obj)
-
-
-# ------------------------------------------------------------------- input side
-# INPUT balancing works fundamentally differently from output: there is no
-# per-app stream to reroute — instead each PHYSICAL mic is nudged (its capture
-# volume) toward a common target so several mics blend at matching loudness. It's
-# a slow, damped, BOUNDED control loop: the leveler never moves a mic more than
-# ±50 % from the user's own setting (kept as the baseline and restored on
-# disable, so it never clobbers their preference), and each cycle only closes
-# half the error (capped ±6 dB) so it eases in without pumping. All in float via
-# PipeWire's own volume — one multiply, lossless.
-_input_truevol = {}      # mic node.name -> baseline capture volume %, pre-balance
-_input_active = False     # do we currently own mic volumes?
-
-
-def _list_phys_sources():
-    out = []
-    r = sh(PACTL, "list", "short", "sources")
-    if r.returncode != 0:
-        return out
-    for line in r.stdout.splitlines():
-        p = line.split("\t")
-        if len(p) < 2:
-            continue
-        name = p[1].strip()
-        if name.endswith(".monitor"):
-            continue
-        if re.match(r"^(rnnoise_source|combined_mics|delayed\.|tailnet-|pw-loopback|auto_null)", name):
-            continue
-        out.append(name)
-    return out
-
-
-def _get_source_volume(name):
-    r = sh(PACTL, "get-source-volume", name)
-    m = re.search(r"(\d+)%", r.stdout or "")
-    return int(m.group(1)) if m else None
-
-
-def _measure_dbfs(name):
-    """Capture ~0.4 s of the mic and return its RMS in dBFS (None if silent or
-    unreadable — in which case we leave the mic untouched)."""
-    need = int(48000 * 4 * 0.4)          # float32 mono @ 48k
-    try:
-        p = subprocess.Popen(
-            [PAREC, "-d", name, "--format=float32le", "--channels=1",
-             "--rate=48000", "--raw"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    except Exception:
-        return None
-    buf = b""
-    try:
-        while len(buf) < need:
-            chunk = p.stdout.read(need - len(buf))
-            if not chunk:
-                break
-            buf += chunk
-    except Exception:
-        pass
-    finally:
-        try:
-            p.kill()
-        except Exception:
-            pass
-    n = len(buf) // 4
-    if n < 100:
-        return None
-    a = array.array("f")
-    a.frombytes(buf[:n * 4])
-    s = 0.0
-    for v in a:
-        s += v * v
-    rms = math.sqrt(s / len(a))
-    if rms <= 1e-6:
-        return None
-    return 20.0 * math.log10(rms)
-
-
-def _input_restore():
-    global _input_active
-    for name, vol in list(_input_truevol.items()):
-        sh(PACTL, "set-source-volume", name, "%d%%" % vol)
-    _input_truevol.clear()
-    _input_active = False
-    _set_input_rows([])
-
-
-def input_loop():
-    global _input_active
-    while True:
-        cfg = load_config()
-        if not cfg["input_enabled"]:
-            if _input_active:
-                _input_restore()
-            time.sleep(1.0)
-            continue
-        _input_active = True
-        rows = []
-        for name in _list_phys_sources():
-            if name not in _input_truevol:
-                cur0 = _get_source_volume(name)
-                if cur0 is None:
-                    continue
-                _input_truevol[name] = cur0
-            base = _input_truevol[name]
-            dbfs = _measure_dbfs(name)
-            cur = _get_source_volume(name)
-            if cur is None:
-                continue
-            if dbfs is None:
-                rows.append({"key": name, "gain": int(round(cur * 100.0 / max(1, base)))})
-                continue
-            # damped step toward target, capped per cycle, bounded to ±50 % of base
-            err = max(-6.0, min(6.0, INPUT_TARGET_DBFS - dbfs))
-            newvol = int(round(cur * (10.0 ** (0.5 * err / 20.0))))
-            lo = max(10, int(base * 0.5))
-            hi = min(150, int(base * 1.5))
-            newvol = max(lo, min(hi, newvol))
-            if abs(cur - newvol) >= 2:
-                sh(PACTL, "set-source-volume", name, "%d%%" % newvol)
-            rows.append({"key": name, "gain": int(round(newvol * 100.0 / max(1, base)))})
-        # forget baselines for mics that vanished (can't restore a gone device)
-        present = set(_list_phys_sources())
-        for gone in [n for n in _input_truevol if n not in present]:
-            _input_truevol.pop(gone, None)
-        _set_input_rows(rows)
-        time.sleep(3.0)
 
 
 # ------------------------------------------------------------------- daemon
@@ -596,9 +500,6 @@ def cmd_daemon(_args):
     signal.signal(signal.SIGHUP, on_hup)
     signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
 
-    # INPUT balancing runs its own slow control loop (parec-measured), driven by
-    # config; independent of the output stream-assignment reconcile.
-    threading.Thread(target=input_loop, daemon=True).start()
     # OUTPUT gain arc: reconstruct applied gain from pre-filter monitor loudness.
     threading.Thread(target=output_gain_loop, daemon=True).start()
 

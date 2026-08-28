@@ -2334,12 +2334,14 @@ let
   '';
 
   # Live applied gains from the daemon's balance.json, as parseable lines:
-  #   out|<gain%>|<sink-input#>,<sink-input#>,...     in|<gain%>|<mic node.name>
+  #   range|<lo dB>|<hi dB>   (auto-calibrated arc display range, if known)
+  #   out|<gain%>|<offset%>|<sink-input#>,...|<gain dB>|<slot>   in|<gain%>|<mic node.name>
   balance-gains-sh = pkgs.writeShellScriptBin "audio-balance-gains" ''
     state="''${XDG_STATE_HOME:-$HOME/.local/state}/qs-audio/balance.json"
     [ -f "$state" ] || exit 0
     ${pkgs.jq}/bin/jq -r '
-      (.output[]? | "out|\(.gain)|\(.offset // 100)|" + ((.ids // []) | map(tostring) | join(","))),
+      (if .range then "range|\(.range.lo)|\(.range.hi)" else empty end),
+      (.output[]? | "out|\(.gain)|\(.offset // 100)|" + ((.ids // []) | map(tostring) | join(",")) + "|\(.gain_db // 0)|\(.slot // "")"),
       (.input[]?  | "in|\(.gain)|\(.key)")
     ' "$state" 2>/dev/null
     exit 0
