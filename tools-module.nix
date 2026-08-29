@@ -62,6 +62,34 @@ in
       };
     };
 
+    # Cast audio time-sync daemon: while a Chromecast is a member of the output
+    # MIX set, auto-measures its buffer latency and delays the local outputs to
+    # match (via `delayed.<sink>` wrappers). Started on demand by the SYNC toggle;
+    # ConditionPathExists makes the choice persist across logins, and the daemon
+    # self-idles unless a cast is actually a mix member.
+    systemd.user.services.audio-cast-sync = {
+      description = "Chromecast audio time-alignment (auto-measured delay)";
+      after = [
+        "graphical-session.target"
+        "pipewire.service"
+        "wireplumber.service"
+        "pipewire-pulse.service"
+      ];
+      partOf = [ "graphical-session.target" ];
+      wantedBy = [ "graphical-session.target" ];
+      unitConfig = {
+        # ON by default: run unless the `disabled` marker exists. The daemon
+        # self-idles when no cast is a mix member, so always-eligible is cheap.
+        ConditionPathExists = "!%S/audio-cast-sync/disabled";
+        StartLimitIntervalSec = 0;
+      };
+      serviceConfig = {
+        ExecStart = "${tools.cast-sync-daemon-sh}/bin/audio-cast-sync-daemon";
+        Restart = "always";
+        RestartSec = "3s";
+      };
+    };
+
     # Per-app output balancing daemon. Idle (assigns nothing) until the config
     # at ~/.config/audio-balance/config.json enables it. It only MOVES app
     # sink-inputs onto the static applvl.* filter-chain pool (declared in
