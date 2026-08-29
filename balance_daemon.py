@@ -397,10 +397,27 @@ def _reconcile_locked():
         if sid in assigned_ids:
             continue
         if not free:
-            break            # pool full — extra streams stay unbalanced on the real sink
+            break            # pool full — extra streams are evicted to the default sink below
         slot = free.pop(0)
         _assign[slot] = sid
         assigned_ids.add(sid)
+
+    # Evict any stream squatting on a slot it is NOT assigned to. WirePlumber's
+    # stream-target restore remembers our own past moves (keyed by app name —
+    # and by shared media.role, which crosses APPS) and respawns streams
+    # DIRECTLY onto applvl sinks, so a new stream can land on another app's
+    # slot and share its leveler, limiter and .out bridge volume (Overwatch's
+    # gauge moved YouTube Music, 2026-08-29). Slot occupancy is authoritative:
+    # a stream assigned elsewhere is re-homed by the loop below (cur != slot);
+    # an UNASSIGNED one (pool full) goes back to the default sink here —
+    # unbalanced on the real output, exactly what "no slot" is meant to be.
+    if dflt:
+        for sid, si in streams_by_id.items():
+            if sid in assigned_ids:
+                continue
+            cur = sink_name.get(si.get("sink_index", ""), "")
+            if cur in SLOT_SINKS:
+                _move(sid, dflt)
 
     # Ensure each assigned stream sits on its slot; publish its per-stream gain.
     rows = []
@@ -416,6 +433,10 @@ def _reconcile_locked():
                 _slot_gain_db.pop(slot, None)
     out_ids = _applvl_out_ids()
     trims_dirty = False
+    # Trims are persisted per APP key but slots are per STREAM: with two
+    # streams of one app the rows would fight over the single _trims entry
+    # every pass (row 1 writes its offset, row 2 deletes it). First row wins.
+    seen_trim_keys = set()
     for slot, sid in _assign.items():
         si = streams_by_id.get(sid)
         if not si:
@@ -437,12 +458,13 @@ def _reconcile_locked():
                 offset = 100
             # The gauge drives this volume directly (audio-balance-setvol);
             # persist what we observe, per app. 100 = default, don't store.
-            if offset != _trims.get(key, 100):
+            if key not in seen_trim_keys and offset != _trims.get(key, 100):
                 if offset == 100:
                     _trims.pop(key, None)
                 else:
                     _trims[key] = offset
                 trims_dirty = True
+        seen_trim_keys.add(key)
         rows.append({"key": key, "ids": [int(sid)], "gain": gains.get(slot, 100),
                      "gain_db": round(gains_db.get(slot, 0.0), 1),
                      "offset": offset, "slot": slot})
