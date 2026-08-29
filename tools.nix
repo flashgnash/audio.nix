@@ -860,6 +860,15 @@ let
   #   kind = "raw" → a process holding the raw ALSA capture device that ISN'T
   #                  PipeWire/WirePlumber (i.e. capturing directly, bypassing
   #                  the graph) — surfaced as a warning row.
+  #   kind = "sys" → (only with `--all`) an always-on/system capture that the
+  #                  default listing deliberately hides — the shell's own
+  #                  level-meter/VAD taps, the rnnoise filter and mic-combiner
+  #                  node captures, the voice assistant's wake-word recorder,
+  #                  the replay buffer — with a human-readable label. Streams
+  #                  that tap PLAYBACK rather than the mic (corked streams,
+  #                  sink monitors, `parec --monitor-stream` readers) stay
+  #                  dropped in BOTH modes: they are not mic consumers.
+  # Without `--all` the output is exactly the historical listing.
   # Trust model: existence comes from the kernel fd table + server-side PipeWire
   # topology, and FILTERING decisions use the kernel's view (the connected
   # source's monitor flag, and each holder's real /proc/PID/exe) — never the
@@ -868,10 +877,27 @@ let
   # the exe (kernel truth) is what the UI reveals on hover. Defeated only by
   # root/kernel-level access, which is out of scope.
   mic-users-sh = pkgs.writeShellScriptBin "audio-mic-users" ''
+    # --all: also emit the always-on/system captures (as `sys` rows) instead of
+    # dropping them. Default output must stay byte-identical to the flagless
+    # historical listing, so the flag only ever ADDS rows.
+    all=no
+    [ "$1" = "--all" ] && all=yes
+
     # Field separator for the awk→read handoff. Must be NON-whitespace: a tab
     # would be treated as IFS-whitespace and collapse empty fields, shifting
     # columns. 0x1f (unit separator) never appears in the data.
     SEP="$(printf '\037')"
+
+    # Emit one `sys|label|exe|pid` row for an always-on capture ($1 = human
+    # label), but only in --all mode. Same trust model as the pw rows: the exe
+    # comes from the kernel's /proc/PID/exe, never a client-set string (empty
+    # for server-side filter nodes, which have no client process at all).
+    sys_row() {
+      [ "$all" = yes ] || return 0
+      sysexe=""
+      [ -n "$pid" ] && sysexe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+      printf 'sys|%s|%s|%s\n' "$1" "$sysexe" "$pid"
+    }
 
     # Source indices that are playback monitors (NOT real mics), from the
     # server-side topology — not the spoofable client `stream.monitor` flag.
@@ -936,6 +962,33 @@ let
       return 1
     }
 
+    # "yes" if $1 belongs to the voice assistant's user service. Its wake-word
+    # recorder captures the mic CONTINUOUSLY by design (same always-listening
+    # class as the replay buffer), so it must never read as an app actively
+    # using the mic. Proven by the systemd cgroup, which a process can't forge.
+    is_assistant() {
+      p="$1"
+      [ -n "$p" ] || return 1
+      case "$(cat "/proc/$p/cgroup" 2>/dev/null)" in
+        *voice-assistant.service*) return 0 ;;
+      esac
+      return 1
+    }
+
+    # "yes" if $1 belongs to the balance daemon's user service. Its slot
+    # loudness readers capture applvl monitors — playback, never mic — but
+    # while the daemon rewires slots a reader's Source transiently reads
+    # unattached, dodging is_monitor and flashing the mic-in-use indicator.
+    # Cgroup-proven, same trust model as is_assistant/is_replay_gsr.
+    is_balance() {
+      p="$1"
+      [ -n "$p" ] || return 1
+      case "$(cat "/proc/$p/cgroup" 2>/dev/null)" in
+        *audio-balance.service*) return 0 ;;
+      esac
+      return 1
+    }
+
     {
       # ── PipeWire capture streams ───────────────────────────────────────────
       pactl list source-outputs 2>/dev/null | awk -v SEP="$SEP" '
@@ -955,19 +1008,37 @@ let
       ' | while IFS="$SEP" read -r id src corked pid appname medianame nodename client; do
         [ "$corked" = "yes" ] && continue
         is_monitor "$src" && continue
+        # Direct sink-input taps (parec --monitor-stream=N, e.g. the balance
+        # daemon's post-leveller readers) report Source: 4294967295 (invalid
+        # index) — they capture PLAYBACK audio straight off a sink-input, never
+        # a mic, so the monitor filter above can't catch them. Server-side
+        # field; a real mic capture always carries a valid source index.
+        [ "$src" = "4294967295" ] && continue
+        # A capture with NO attached source ("n/a" — mid-move/reconnect, e.g.
+        # while the balance daemon rewires slots) is hearing nothing; counting
+        # it flashes the indicator for a frame. Dropped in both modes.
+        [ "$src" = "n/a" ] && continue
+        # The balance daemon's own loudness readers (cgroup-proven) — belt and
+        # braces on top of the source checks, since its readers are the ones
+        # that transiently detach.
+        is_balance "$pid" && { sys_row "loudness meter (balance)"; continue; }
         # Our own bar level meter (qs-mic-level) and per-mic VAD taps (qs-vad) —
         # never count them as mic users.
-        [ "$appname" = "qs-mic-level" ] && continue
-        [ "$appname" = "qs-vad" ] && continue
+        [ "$appname" = "qs-mic-level" ] && { sys_row "level meter (shell)"; continue; }
+        [ "$appname" = "qs-vad" ] && { sys_row "voice detect (shell)"; continue; }
+        # The voice assistant's always-on wake-word recorder (cgroup-proven).
+        is_assistant "$pid" && { sys_row "voice assistant (wake)"; continue; }
         # The RNNoise filter's own passive capture: a server-side filter node
         # has no Client (a real pulse/pipewire app always does, and can't fake
         # "n/a"), so this can't be spoofed by naming a stream capture.rnnoise_source.
-        [ "$nodename" = "capture.rnnoise_source" ] && [ "$client" = "n/a" ] && continue
+        [ "$nodename" = "capture.rnnoise_source" ] && [ "$client" = "n/a" ] \
+          && { sys_row "noise filter (rnnoise)"; continue; }
         # The mic combiner's per-mic capture streams (see combined_mics in
         # flakes/audio/pipewire.nix) — server-side too, same no-Client rule. Prefix
-        # match because PipeWire may uniquify duplicate stream node names.
+        # match because PipeWire may uniquify duplicate stream node names (the
+        # per-mic sys rows are identical and collapse under the final sort -u).
         case "$nodename" in capture.combined_mics*)
-          [ "$client" = "n/a" ] && continue ;;
+          [ "$client" = "n/a" ] && { sys_row "mic blend (combiner)"; continue; } ;;
         esac
         # (tailnet-audio donated mics are plain pipe-source nodes with no internal
         # capture stream, so they need no exclusion here — they behave exactly
@@ -979,7 +1050,7 @@ let
         # node "gsr-default_input"; its default_output capture is a monitor and
         # is already dropped by is_monitor above.
         case "$nodename" in gsr-*)
-          is_replay_gsr "$pid" && continue ;;
+          is_replay_gsr "$pid" && { sys_row "replay buffer (gsr)"; continue; } ;;
         esac
         exe=""
         [ -n "$pid" ] && exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
