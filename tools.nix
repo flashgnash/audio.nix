@@ -2387,6 +2387,19 @@ let
     ${pkgs.coreutils}/bin/cat "''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/delay" 2>/dev/null || echo 0
   '';
 
+  # Mic-based auto-calibrator: plays a chirp into the combine, records a mic that hears
+  # BOTH the local speaker and the cast, cross-correlates the two arrivals, and nudges
+  # the per-device trim until they line up. Needs an active cast + MIX on + a mic.
+  cast-sync-calibrate-py = pkgs.writeText "cast-sync-calibrate.py" (
+    builtins.readFile ../../scripts/cast_sync_calibrate.py
+  );
+  cast-sync-calibrate-sh = pkgs.writeShellScriptBin "audio-cast-sync-calibrate" ''
+    export CAST_SYNC_OFFSET=${cast-sync-offset-sh}/bin/audio-cast-sync-offset
+    export OUTDUP_RELOAD=${outdup-reload-sh}/bin/audio-outdup-reload
+    export PATH="${pkgs.pulseaudio}/bin:$PATH"
+    exec ${pkgs.python3.withPackages (ps: [ ps.numpy ])}/bin/python ${cast-sync-calibrate-py} "$@"
+  '';
+
   # Sync is ON by default; a `disabled` marker turns it off. Inverted so that the
   # feature works out of the box (the common case: mix a cast → want it in sync).
   cast-sync-disabled-path = ''"''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/disabled"'';
@@ -2585,6 +2598,7 @@ let
     cast-sync-toggle-sh
     cast-sync-offset-sh
     cast-sync-delay-sh
+    cast-sync-calibrate-sh
   ];
 
   # Human-facing dispatcher: `audioctl rnnoise-toggle`, `audioctl list-sinks`,
