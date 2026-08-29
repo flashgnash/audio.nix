@@ -106,6 +106,8 @@ let
         # snd_aloop loopback ("Loopback Analog Stereo", guest-gaming plumbing)
         # is internal, never user-selectable — same rule as list-sources.
         if (name ~ /platform-snd_aloop/) return
+        # applvl.* = the per-app balance pool (internal leveler sinks).
+        if (name ~ /^applvl\./) return
         bt  = (name ~ /^bluez_/) ? 1 : 0
         cur = (name == def) ? "1" : "0"
         printf "%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt
@@ -301,7 +303,7 @@ let
     sync_on=1
     [ -f "''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/disabled" ] && sync_on=0
     present=$(pactl list short sinks 2>/dev/null | awk '
-      $2 != "combined_out" && $2 !~ /platform-snd_aloop/ { print $2 }')
+      $2 != "combined_out" && $2 !~ /platform-snd_aloop/ && $2 !~ /^applvl\./ { print $2 }')
     # Mix-set entries to fold in: the configured .sinks[], or — when empty ("all
     # sinks" mode) — every present sink, run through the SAME loop below so the
     # cast-sync delay substitution applies in all-sinks mode too.
@@ -369,9 +371,9 @@ let
   list-dup-sinks-sh = pkgs.writeShellScriptBin "audio-list-dup-sinks" ''
     sinks=$(pactl list sinks | awk '
       ${audio-naming-awk}
-      # snd_aloop excluded from the combine slaves; drop it here too so a
-      # stray stream into it never grows a mixer row.
-      function emit() { if (name != "" && name !~ /platform-snd_aloop/) printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
+      # snd_aloop and the applvl balance pool are excluded from the combine
+      # slaves; drop them here too so internal plumbing never grows a mixer row.
+      function emit() { if (name != "" && name !~ /platform-snd_aloop/ && name !~ /^applvl\./) printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
       /^Sink #/ { emit(); idx = substr($2, 2); name=""; desc=""; port=""; alsa_card=""; alsa_device="" }
       /^\tName:/        { name = $2 }
       /^\tDescription:/ { desc = substr($0, index($0, $2)) }
