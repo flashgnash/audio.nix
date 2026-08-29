@@ -233,7 +233,14 @@ let
     fi
   '';
 
+  # These three combine-management scripts use bare awk/grep/cat/pactl and are called
+  # from MINIMAL-PATH systemd services (audio-devices, cast-sync, mesh hold-open). A
+  # user service's PATH lacks gawk → bare `awk` is command-not-found → the script
+  # silently no-ops mid-pipeline (this is the class of bug that made cast-sync never
+  # apply). Make them self-contained: prepend the tools they need.
+  combineToolPath = "${pkgs.pulseaudio}/bin:${pkgs.gawk}/bin:${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin";
   outdup-toggle-sh = pkgs.writeShellScriptBin "audio-outdup-toggle" ''
+    export PATH="${combineToolPath}:$PATH"
     prevfile="$XDG_RUNTIME_DIR/qs-outdup-prev"
     have_combined() {
       pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF combined_out
@@ -281,6 +288,7 @@ let
   # every present sink minus the snd_aloop loopback. Falls back to all if the
   # chosen set has no present members (never build an empty combine sink).
   mixset-slaves-sh = pkgs.writeShellScriptBin "audio-mixset-slaves" ''
+    export PATH="${combineToolPath}:$PATH"
     cfg=${mixset-config-path}
     # Remote tailnet outputs are stored as their mesh id (`mesh:output:host:name`);
     # the audio-devices daemon keeps their route alive and writes the live proxy
@@ -333,6 +341,7 @@ let
   # mix-set changes so edits apply immediately. Parks the default on a real sink
   # during the swap so streams aren't orphaned, then points it back.
   outdup-reload-sh = pkgs.writeShellScriptBin "audio-outdup-reload" ''
+    export PATH="${combineToolPath}:$PATH"
     [ "$(pactl get-default-sink 2>/dev/null)" = "combined_out" ] || exit 0
     slaves=$(${mixset-slaves-sh}/bin/audio-mixset-slaves)
     [ -z "$slaves" ] && exit 0
@@ -2025,7 +2034,7 @@ let
   # and for combined_mics state changes (calibration trigger). SIGHUP drops
   # stored offsets and forces a fresh calibration.
   mix-sync-daemon-py = pkgs.writeText "mix-sync-daemon.py" ''
-    import json, math, os, signal, struct, subprocess, threading, time
+    import json, math, os, select, signal, struct, subprocess, threading, time
 
     STATE_DIR = os.path.join(
         os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
@@ -2076,18 +2085,42 @@ let
         return names
 
     def record_pair(a, b, seconds):
-        """Simultaneously capture two raw mics; returns (samples_a, samples_b)."""
+        """Simultaneously capture two raw mics; returns (samples_a, samples_b).
+        Deadline-bounded and always reaps both parec captures — a stalled/suspended
+        mic (no EOF) must NOT block forever: that used to hang calibrate() inside its
+        try, so the finally never ran, self.measuring stayed True, and ALL future
+        calibration wedged for the session."""
         def rec(mic):
             return subprocess.Popen(
                 ["parec", "--rate=%d" % RATE, "--channels=1", "--format=s16le",
                  "-d", mic, "--client-name=mix-sync-cal"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        pa, pb = rec(a), rec(b)
-        want = RATE * seconds * 2
-        da = pa.stdout.read(want)
-        db = pb.stdout.read(want)
-        for p in (pa, pb):
-            p.kill()
+        pa = pb = None
+        try:
+            pa, pb = rec(a), rec(b)
+            want = RATE * seconds * 2
+            deadline = time.monotonic() + seconds + 2.0   # hard cap over the nominal
+            def read_until(p):
+                buf = bytearray()
+                fd = p.stdout.fileno()
+                while len(buf) < want and time.monotonic() < deadline:
+                    r, _, _ = select.select([fd], [], [], 0.2)
+                    if not r:
+                        continue
+                    chunk = os.read(fd, want - len(buf))
+                    if not chunk:      # EOF (device gone)
+                        break
+                    buf += chunk
+                return bytes(buf)
+            da = read_until(pa)
+            db = read_until(pb)
+        finally:
+            for p in (pa, pb):
+                if p is not None:
+                    try:
+                        p.kill(); p.wait(timeout=1)
+                    except Exception:
+                        pass
         n = min(len(da), len(db)) // 2
         return (struct.unpack("<%dh" % n, da[:n*2]),
                 struct.unpack("<%dh" % n, db[:n*2]))
