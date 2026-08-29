@@ -161,7 +161,10 @@ def list_sink_inputs():
 
 
 def app_key(si):
-    """Stable per-app grouping key (mirrors the bar's per-app gauges)."""
+    """Stable per-app grouping key (mirrors the bar's per-app gauges). This is the
+    key the reconcile trims/publishes under: binary-first and lowercased so it's
+    stable across runs, but for the shared Electron/Chromium launcher we fall back
+    to the app/node name so two distinct Electron apps don't collide on one trim."""
     b = (si.get("binary") or "").lower()
     if b in ("", "electron", "chromium"):
         return (si.get("appname") or si.get("node_name") or "app").lower()
@@ -346,15 +349,48 @@ def reconcile():
         _reconcile_locked()
 
 
+def _disable_cleanup():
+    """One-shot teardown when balancing goes off: evict anything still parked on a
+    slot back to the default sink and reset the post-leveler trims so nothing is
+    left attenuated. Only worth its pactl cost when we actually held state — the
+    caller gates on that so idle-disabled ticks never reach here."""
+    dflt = default_sink()
+    sink_name = _sink_index_to_name()
+    out_ids = _applvl_out_ids()
+    try:
+        streams = list_sink_inputs()
+    except Exception:
+        streams = []
+    for si in streams:
+        cur = sink_name.get(si.get("sink_index", ""), "")
+        if cur in SLOT_SINKS and dflt and not _SKIP_STREAM_RE.match(si.get("node_name", "")):
+            _move(si["id"], dflt)
+    for slot in SLOT_SINKS:
+        _set_out_vol(slot, 100, out_ids)
+    _assign.clear()
+    _slot_stream.clear()
+    _set_output_rows([])
+
+
 def _reconcile_locked():
     global _last_published
-    cfg = load_config()
+    # Balancing off is the DEFAULT — bail before ANY pactl/subprocess call so the
+    # ticker (and every subscribe wake) costs nothing on an idle desktop. Only when
+    # we still hold in-memory assignments (i.e. we just transitioned enabled→
+    # disabled) do we pay for the one-shot cleanup, which then empties that state so
+    # subsequent disabled ticks return here immediately. Re-enabling is unaffected:
+    # the config-change signal / subscribe thread re-triggers reconcile and this
+    # guard falls through once output_enabled flips back on.
+    if not load_config()["output_enabled"]:
+        if _assign or _slot_stream:
+            _disable_cleanup()
+        return
+
     try:
         streams = list_sink_inputs()
     except Exception:
         return  # transient pactl failure — keep current assignment
     sink_name = _sink_index_to_name()
-    dflt = default_sink()
 
     # One slot per STREAM (sink-input), NOT per app. Two streams of the same app
     # — e.g. two browser profiles playing different things — are genuinely
@@ -369,21 +405,6 @@ def _reconcile_locked():
         if _SKIP_STREAM_RE.match(nn):
             continue
         streams_by_id[si["id"]] = si
-
-    if not cfg["output_enabled"]:
-        # Balancing off — evict anything still parked on a slot back to default,
-        # and reset the post-leveler trims so nothing is left attenuated.
-        out_ids = _applvl_out_ids()
-        for si in streams:
-            cur = sink_name.get(si.get("sink_index", ""), "")
-            if cur in SLOT_SINKS and dflt and not _SKIP_STREAM_RE.match(si.get("node_name", "")):
-                _move(si["id"], dflt)
-        for slot in SLOT_SINKS:
-            _set_out_vol(slot, 100, out_ids)
-        _assign.clear()
-        _slot_stream.clear()
-        _set_output_rows([])
-        return
 
     # Drop assignments whose stream has gone away.
     for slot in list(_assign.keys()):
@@ -423,7 +444,7 @@ def _reconcile_locked():
         cur = sink_name.get(si.get("sink_index", ""), "")
         if cur != slot:
             _move(si["id"], slot)
-        key = (si.get("appname") or si.get("node_name") or si.get("binary") or "app")
+        key = app_key(si)
         # New stream on this slot? Apply the APP's saved post-leveler trim (so
         # trims survive restarts / reassignment) rather than inheriting the
         # previous stream's offset. Unknown apps start matched (100%).
