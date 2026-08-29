@@ -1314,6 +1314,11 @@ let
   # or disabled, it spawns nothing (no meters, ~1 stat/sec idle) so it costs
   # nothing when no secondary mics are configured.
   #
+  # While live it also mirrors the primary mic's SET capture-volume % (averaged
+  # across its channels) onto the other candidates, so the group behaves as one
+  # logical mic volume-wise. That is a settings copy driven by pactl subscribe
+  # change events — NOT loudness measurement/AGC (a previous AGC was reverted).
+  #
   # Routing reuses the existing rnnoise plumbing: when the noise-cancel virtual
   # source is the default (denoise on), it retargets capture.rnnoise_source for a
   # seamless swap; otherwise (denoise off) it sets the default source directly.
@@ -1444,6 +1449,24 @@ let
         except Exception:
             return []
 
+    # Average SET volume % of a source across its channels (pactl reports a
+    # per-channel %), or None if the source is absent/unreadable. This reads
+    # the configured volume setting only — never measured audio levels.
+    def source_avg_volume(name):
+        try:
+            out = subprocess.run(["pactl", "get-source-volume", name],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return None
+        vols = []
+        for tok in out.replace(",", " ").split():
+            if tok.endswith("%"):
+                try:
+                    vols.append(float(tok[:-1]))
+                except ValueError:
+                    pass
+        return (sum(vols) / len(vols)) if vols else None
+
     class Meter:
         """One VAD meter subprocess per mic; a thread folds its `speech snr level`
         lines into a live voice-run estimate."""
@@ -1548,6 +1571,7 @@ let
             self.left_at = {}       # mic -> monotonic when we last switched AWAY from it
             self.verify_at = 0.0    # last belief-vs-reality feed check
             self.verify_timer = None  # debounce for node-lifecycle feed checks
+            self.volsync_timer = None # debounce for follower volume sync
             self.mix_active = False   # blend feeding the filter -> stand down
             self.mix_check_at = 0.0
             self.lock = threading.RLock()
@@ -1822,6 +1846,9 @@ let
                     self._set_active(None)
                 log("state: active=%s auto=%s filter=%s mic=%s"
                     % (self.system_active(), self.auto_on(), self.filter_on(), self.active_mic))
+                # Converge follower volumes on start / enable / config edits
+                # (the handler no-ops when auto is off or <2 candidates).
+                self._schedule_volsync()
 
         # ── node-lifecycle feed check ─────────────────────────────────────
         # The feed-drift check in _select only runs on speech windows, so it
@@ -1870,6 +1897,58 @@ let
                 self.verify_timer.daemon = True
                 self.verify_timer.start()
 
+        # ── follower volume sync (settings copy — deliberately NOT AGC) ───
+        # While auto-switch is live the candidate set acts as one logical mic,
+        # so the SET capture volume follows too: the primary mic's configured
+        # volume % (averaged across its channels) is copied to every other
+        # candidate. Pure settings mirroring off pactl subscribe change
+        # events; no measured loudness ever feeds back into a volume (a
+        # previous AGC implementation was explicitly reverted).
+        # Primary = the mic currently feeding the filter (active_mic): that is
+        # the one the user hears and adjusts, which beats "highest-priority
+        # candidate" when the two differ (walked away to a secondary). Falls
+        # back to the top-priority candidate before the first route settles.
+        def _sync_volumes(self):
+            with self.lock:
+                cands = self._candidates()
+                if not self.auto_on() or len(cands) < 2:
+                    return
+                primary = (self.active_mic if self.active_mic in cands
+                           else cands[0])
+            avg = source_avg_volume(primary)
+            if avg is None:
+                return       # primary absent/unreadable: leave followers be
+            target = int(round(avg))
+            for mic in cands:
+                if mic == primary:
+                    continue
+                cur = source_avg_volume(mic)
+                # Compare-before-set is the event-loop guard: our own
+                # set-source-volume fires more change events, but on that
+                # pass every follower already reads back equal to target,
+                # nothing differs by >=1%, and no further sets happen —
+                # idempotent, converges in one extra (silent) pass.
+                if cur is None or abs(cur - target) < 1.0:
+                    continue
+                try:
+                    subprocess.run(["pactl", "set-source-volume", mic,
+                                    "%d%%" % target], timeout=5)
+                    log("volume follow:", mic, "-> %d%%" % target,
+                        "(primary", primary + ")")
+                except Exception:
+                    pass
+
+        def _schedule_volsync(self):
+            # Coalesce the burst of change events one volume drag emits (same
+            # one-shot-timer debounce as _schedule_verify — armed per event,
+            # no clock polling).
+            with self.lock:
+                if self.volsync_timer is not None:
+                    self.volsync_timer.cancel()
+                self.volsync_timer = threading.Timer(0.3, self._sync_volumes)
+                self.volsync_timer.daemon = True
+                self.volsync_timer.start()
+
         # ── default-change + node events (pactl subscribe; no polling) ────
         def watch_default(self):
             try:
@@ -1887,6 +1966,12 @@ let
                     # NB: " on source #" — a bare " on source" also matches
                     # "on source-output", i.e. every app stream open/close.
                     self._schedule_verify()      # device appeared/vanished
+                elif " on source #" in line and "'change'" in line:
+                    # A source property changed — likely a volume set. pactl
+                    # subscribe names neither the property nor the node, so
+                    # the debounced handler just re-reads and no-ops when the
+                    # volumes already agree (also the self-event guard).
+                    self._schedule_volsync()
 
         def reload_loop(self):
             while True:
