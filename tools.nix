@@ -2763,15 +2763,22 @@ let
   # not currently on a balance slot.
   balance-setvol-sh = pkgs.writeShellScriptBin "audio-balance-setvol" ''
     PATH=${pkgs.pulseaudio}/bin:${pkgs.gawk}/bin:$PATH
-    id="$1"; pct="$2"
+    id="$1"; pct="$2"; slot="$3"
     [ -z "$id" ] || [ -z "$pct" ] && exit 1
-    # which sink INDEX is this stream on?
-    sidx=$(pactl list sink-inputs | awk -v want="$id" '
-      /^Sink Input #/ { cur=substr($3,2) }
-      /^\tSink:/      { if (cur==want) { print $2; exit } }')
-    [ -z "$sidx" ] && exit 0
-    # index -> name; must be a balance slot
-    slot=$(pactl list short sinks | awk -v i="$sidx" '$1==i {print $2}')
+    # The caller (the panel gauge) usually already knows the slot from the
+    # daemon's rows and passes it as $3 — this runs on every drag tick, so
+    # skipping the stream→sink→slot re-resolution (two extra full pactl
+    # dumps = two extra pulse clients per call) matters. Bare 2-arg calls
+    # still resolve it themselves.
+    if [ -z "$slot" ]; then
+      # which sink INDEX is this stream on?
+      sidx=$(pactl list sink-inputs | awk -v want="$id" '
+        /^Sink Input #/ { cur=substr($3,2) }
+        /^\tSink:/      { if (cur==want) { print $2; exit } }')
+      [ -z "$sidx" ] && exit 0
+      # index -> name; must be a balance slot
+      slot=$(pactl list short sinks | awk -v i="$sidx" '$1==i {print $2}')
+    fi
     case "$slot" in applvl.*) ;; *) exit 0 ;; esac
     # find the applvl.<n>.out bridge sink-input and set its volume
     outid=$(pactl list sink-inputs | awk -v n="$slot.out" '
