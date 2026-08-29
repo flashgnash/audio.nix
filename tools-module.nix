@@ -24,15 +24,15 @@ in
     environment.systemPackages = [ tools.audio-tools ];
 
     # Passive USB-audio crackle guard: raises the USB sinks' ALSA headroom
-    # when they actually underrun and decays it when quiet. Opt-in via the
-    # flag file (audio-xrun-guard-toggle manages it); ConditionPathExists
-    # makes the choice persist across logins.
+    # when they actually underrun and decays it when quiet. ON by default;
+    # opting OUT drops the disable flag file (audio-xrun-guard-toggle manages
+    # it) and ConditionPathExists makes the choice persist across logins.
     systemd.user.services.audio-xrun-guard = {
       description = "USB audio xrun guard (auto headroom)";
       after = [ "graphical-session.target" ];
       partOf = [ "graphical-session.target" ];
       wantedBy = [ "graphical-session.target" ];
-      unitConfig.ConditionPathExists = "%E/qs-audio-xrun-guard-enabled";
+      unitConfig.ConditionPathExists = "!%E/qs-audio-xrun-guard-disabled";
       serviceConfig = {
         ExecStart = "${tools.audio-xrun-guard-sh}/bin/audio-xrun-guard";
         Restart = "on-failure";

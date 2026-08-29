@@ -666,8 +666,10 @@ let
       }
   '';
 
-  # Guard on/off = whether the user service runs. The flag file makes the
-  # choice stick across logins (the unit's ConditionPathExists checks it).
+  # Guard on/off = whether the user service runs. It is ON BY DEFAULT: the
+  # unit only skips startup when the DISABLE flag exists (its
+  # ConditionPathExists=!… checks for it), so the toggle creates/removes that
+  # flag to make an opt-out stick across logins.
   xrun-guard-status-sh = pkgs.writeShellScriptBin "audio-xrun-guard-status" ''
     if ${pkgs.systemd}/bin/systemctl --user is-active -q audio-xrun-guard 2>/dev/null; then
       echo on
@@ -677,12 +679,12 @@ let
   '';
 
   xrun-guard-toggle-sh = pkgs.writeShellScriptBin "audio-xrun-guard-toggle" ''
-    flag="''${XDG_CONFIG_HOME:-$HOME/.config}/qs-audio-xrun-guard-enabled"
+    flag="''${XDG_CONFIG_HOME:-$HOME/.config}/qs-audio-xrun-guard-disabled"
     if ${pkgs.systemd}/bin/systemctl --user is-active -q audio-xrun-guard 2>/dev/null; then
       ${pkgs.systemd}/bin/systemctl --user stop audio-xrun-guard
-      rm -f "$flag"
-    else
       touch "$flag"
+    else
+      rm -f "$flag"
       ${pkgs.systemd}/bin/systemctl --user start audio-xrun-guard
     fi
     echo done
