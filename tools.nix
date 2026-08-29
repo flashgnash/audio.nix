@@ -99,6 +99,10 @@ let
         # route proxy carries tailnet_audio.route, and cast proxies are cast*_ .
         if (is_route) return
         if (name ~ /^castaudio_/ || name ~ /^cast_/) return
+        # cast-sync delay wrappers (delayed.<sink> + bare pw-loopback nodes) are
+        # internal plumbing: they interpose a fixed delay in front of a real sink
+        # to time-align it with a cast, and are represented by that real sink.
+        if (name ~ /^delayed\./ || name ~ /^pw-loopback/) return
         # snd_aloop loopback ("Loopback Analog Stereo", guest-gaming plumbing)
         # is internal, never user-selectable — same rule as list-sources.
         if (name ~ /platform-snd_aloop/) return
@@ -279,34 +283,51 @@ let
   # every present sink minus the snd_aloop loopback. Falls back to all if the
   # chosen set has no present members (never build an empty combine sink).
   mixset-slaves-sh = pkgs.writeShellScriptBin "audio-mixset-slaves" ''
-        cfg=${mixset-config-path}
-        # Remote tailnet outputs are stored as their mesh id (`mesh:output:host:name`);
-        # the audio-devices daemon keeps their route alive and writes the live proxy
-        # sink name here so we can fold it into the combine slaves.
-        proxymap="''${XDG_RUNTIME_DIR:-/tmp}/audio-mix/mesh-proxies"
-        present=$(pactl list short sinks 2>/dev/null | awk '
-          $2 != "combined_out" && $2 !~ /platform-snd_aloop/ && $2 !~ /^applvl\./ { print $2 }')
-        slaves=""
-        # Iterate line-by-line: mesh ids embed spaces (device names), so word-splitting
-        # would shred them.
-        while IFS= read -r s; do
-          [ -z "$s" ] && continue
+    cfg=${mixset-config-path}
+    # Remote tailnet outputs are stored as their mesh id (`mesh:output:host:name`);
+    # the audio-devices daemon keeps their route alive and writes the live proxy
+    # sink name here so we can fold it into the combine slaves.
+    proxymap="''${XDG_RUNTIME_DIR:-/tmp}/audio-mix/mesh-proxies"
+    # Cast-sync: when ON, a real LOCAL slave X is served through its delay wrapper
+    # `delayed.X` (spawned by the cast-sync daemon) so it lags to match the cast's
+    # buffer. The cast sink (castaudio_*) and mesh proxies (tailnet-out-*) stay raw
+    # — they are the network-buffered references everything else aligns to.
+    sync_on=1
+    [ -f "''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/disabled" ] && sync_on=0
+    present=$(pactl list short sinks 2>/dev/null | awk '
+      $2 != "combined_out" && $2 !~ /platform-snd_aloop/ && $2 !~ /^applvl\./ { print $2 }')
+    # Mix-set entries to fold in: the configured .sinks[], or — when empty ("all
+    # sinks" mode) — every present sink, run through the SAME loop below so the
+    # cast-sync delay substitution applies in all-sinks mode too.
+    entries=$([ -f "$cfg" ] && ${pkgs.jq}/bin/jq -r '(.sinks // [])[]' "$cfg" 2>/dev/null)
+    [ -z "$entries" ] && entries="$present"
+    slaves=""
+    # Iterate line-by-line: mesh ids embed spaces (device names), so word-splitting
+    # would shred them.
+    while IFS= read -r s; do
+      [ -z "$s" ] && continue
+      case "$s" in
+        mesh:*)
+          px=""
+          [ -f "$proxymap" ] && px=$(${pkgs.gawk}/bin/awk -F'\t' -v k="$s" \
+            '$1 == k { print $2; exit }' "$proxymap" 2>/dev/null)
+          [ -n "$px" ] && printf '%s\n' "$present" | grep -qxF "$px" \
+            && slaves="$slaves''${slaves:+,}$px" ;;
+        *)
+          printf '%s\n' "$present" | grep -qxF "$s" || continue
+          emit="$s"
           case "$s" in
-            mesh:*)
-              px=""
-              [ -f "$proxymap" ] && px=$(${pkgs.gawk}/bin/awk -F'\t' -v k="$s" \
-                '$1 == k { print $2; exit }' "$proxymap" 2>/dev/null)
-              [ -n "$px" ] && printf '%s\n' "$present" | grep -qxF "$px" \
-                && slaves="$slaves''${slaves:+,}$px" ;;
-            *)
-              printf '%s\n' "$present" | grep -qxF "$s" \
-                && slaves="$slaves''${slaves:+,}$s" ;;
+            alsa_*|bluez_*)
+              if [ "$sync_on" = 1 ] \
+                 && printf '%s\n' "$present" | grep -qxF "delayed.$s"; then
+                emit="delayed.$s"
+              fi ;;
           esac
-        done <<EOF
-    $([ -f "$cfg" ] && ${pkgs.jq}/bin/jq -r '(.sinks // [])[]' "$cfg" 2>/dev/null)
-    EOF
-        [ -z "$slaves" ] && slaves=$(printf '%s\n' "$present" | ${pkgs.coreutils}/bin/paste -sd,)
-        printf '%s\n' "$slaves"
+          slaves="$slaves''${slaves:+,}$emit" ;;
+      esac
+    done < <(printf '%s\n' "$entries")
+    [ -z "$slaves" ] && slaves=$(printf '%s\n' "$present" | ${pkgs.coreutils}/bin/paste -sd,)
+    printf '%s\n' "$slaves"
   '';
 
   # Rebuild combined_out with the current mix-set slaves — but only if the
@@ -358,6 +379,16 @@ let
         for (i = 1; i <= n; i++) {
           split(lines[i], f, "|")
           snkname[f[1]] = f[2]; snkdisp[f[1]] = f[3]
+          dispByName[f[2]] = f[3]
+        }
+        # A cast-sync delay wrapper (delayed.<sink>) stands in for its real output
+        # while SYNC is on: show the row under the real device name, not the
+        # wrapper (cast sync) description, so the mixer stays recognisable.
+        for (k in snkname) {
+          if (snkname[k] ~ /^delayed\./) {
+            real = substr(snkname[k], 9)
+            if (real in dispByName) snkdisp[k] = dispByName[real]
+          }
         }
       }
       function flush() {
@@ -2276,6 +2307,83 @@ let
     exec ${pkgs.python3}/bin/python ${mix-sync-daemon-py}
   '';
 
+  # ── Cast audio time-sync ────────────────────────────────────────────────────
+  # Auto-measures a Chromecast cast's end-to-end latency and delays the local MIX
+  # outputs to match (via `delayed.<sink>` wrappers folded into combined_out by
+  # mixset-slaves). Only meaningful while a cast is a member of the output MIX set.
+  cast-sync-daemon-py = pkgs.writeText "cast-sync-daemon.py" (
+    builtins.readFile ../../scripts/cast_sync_daemon.py
+  );
+  # gawk/gnugrep/coreutils are REQUIRED on PATH: the daemon shells out to
+  # outdup-reload + mixset-slaves, which use bare `awk`/`grep`/`cat`. A systemd user
+  # service's PATH is minimal (no gawk), so without this the reload silently no-ops
+  # (mixset-slaves → empty → `outdup-reload` bails) and the delay never reaches the
+  # combine — sync measures but never applies.
+  cast-sync-daemon-sh = pkgs.writeShellScriptBin "audio-cast-sync-daemon" ''
+    export PATH="${pkgs.pulseaudio}/bin:${pkgs.pipewire}/bin:${pkgs.gawk}/bin:${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin:${outdup-reload-sh}/bin:${mixset-slaves-sh}/bin:$PATH"
+    exec ${pkgs.python3}/bin/python ${cast-sync-daemon-py}
+  '';
+
+  # Manual sync trim, PER cast device (each Chromecast buffers differently). Targets
+  # the currently-active cast (from its marker):
+  #   audio-cast-sync-offset              → print this device's trim (seconds)
+  #   audio-cast-sync-offset <delta>      → ADD delta (e.g. 0.05 / -0.05), print new
+  #   audio-cast-sync-offset set <value>  → SET absolute trim, print new
+  # The daemon re-reads it every tick, so changes are live.
+  cast-sync-offset-sh = pkgs.writeShellScriptBin "audio-cast-sync-offset" ''
+    marker="''${XDG_RUNTIME_DIR:-/tmp}/castaudio/active"
+    device=$(${pkgs.gawk}/bin/awk -F= '$1=="device"{print $2}' "$marker" 2>/dev/null)
+    if [ -z "$device" ]; then printf '0\n'; exit 0; fi   # no active cast → nothing to trim
+    key=$(printf '%s' "$device" | ${pkgs.coreutils}/bin/tr -c 'A-Za-z0-9' '_')
+    f="''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/offset-$key"
+    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$f")"
+    cur=$(${pkgs.coreutils}/bin/cat "$f" 2>/dev/null || echo 0)
+    if [ "''${1:-}" = set ]; then
+      new=$(${pkgs.gawk}/bin/awk -v v="''${2:-0}" 'BEGIN{ if(v<-5)v=-5; if(v>15)v=15; printf "%.3f", v }')
+      printf '%s\n' "$new" > "$f"; printf '%s\n' "$new"
+    elif [ -n "''${1:-}" ]; then
+      new=$(${pkgs.gawk}/bin/awk -v c="$cur" -v d="$1" \
+        'BEGIN{ v=c+d; if(v<-5)v=-5; if(v>15)v=15; printf "%.3f", v }')
+      printf '%s\n' "$new" > "$f"; printf '%s\n' "$new"
+    else
+      printf '%s\n' "''${cur:-0}"
+    fi
+  '';
+
+  # The effective delay currently applied for the active cast (auto-measured + trim),
+  # in seconds — what the per-card latency readout shows.
+  cast-sync-delay-sh = pkgs.writeShellScriptBin "audio-cast-sync-delay" ''
+    ${pkgs.coreutils}/bin/cat "''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/delay" 2>/dev/null || echo 0
+  '';
+
+  # Sync is ON by default; a `disabled` marker turns it off. Inverted so that the
+  # feature works out of the box (the common case: mix a cast → want it in sync).
+  cast-sync-disabled-path = ''"''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/disabled"'';
+
+  cast-sync-status-sh = pkgs.writeShellScriptBin "audio-cast-sync-status" ''
+    if [ -f ${cast-sync-disabled-path} ]; then echo off; else echo on; fi
+  '';
+
+  # Flip "delay local outputs to match the cast" on/off. Default = ON. OFF: write the
+  # disabled marker, rebuild the combine WITHOUT the wrappers first (while they're
+  # still alive → no gap), then stop the daemon (it tears the wrappers down). ON:
+  # remove the marker, start the daemon, and fold the cast in now — the daemon then
+  # spawns the delay wrappers and reloads again.
+  cast-sync-toggle-sh = pkgs.writeShellScriptBin "audio-cast-sync-toggle" ''
+    f=${cast-sync-disabled-path}
+    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$f")"
+    if [ -f "$f" ]; then
+      ${pkgs.coreutils}/bin/rm -f "$f"
+      ${pkgs.systemd}/bin/systemctl --user start audio-cast-sync >/dev/null 2>&1 || true
+      ${outdup-reload-sh}/bin/audio-outdup-reload >/dev/null 2>&1 || true
+    else
+      : > "$f"
+      ${outdup-reload-sh}/bin/audio-outdup-reload >/dev/null 2>&1 || true
+      ${pkgs.systemd}/bin/systemctl --user stop audio-cast-sync >/dev/null 2>&1 || true
+    fi
+    echo done
+  '';
+
   # Global "recency of use" store for the unified audio device list. `touch <key>`
   # stamps a device (any kind — local sink/source, BT mac, cast name, tailnet
   # host:sink) with the current time; `list` prints `key<TAB>epoch` for the panel
@@ -2441,6 +2549,11 @@ let
     auto-mic-read-sh
     auto-mic-mutate-sh
     mix-sync-daemon-sh
+    cast-sync-daemon-sh
+    cast-sync-status-sh
+    cast-sync-toggle-sh
+    cast-sync-offset-sh
+    cast-sync-delay-sh
   ];
 
   # Human-facing dispatcher: `audioctl rnnoise-toggle`, `audioctl list-sinks`,
@@ -2466,6 +2579,7 @@ rec {
     audio-xrun-guard-sh
     auto-mic-daemon-sh
     mix-sync-daemon-sh
+    cast-sync-daemon-sh
     balance-daemon-sh
     ;
 
