@@ -246,7 +246,7 @@ pipewire-screenaudio:
     #
     # Tuning (adjust via rb + listen):
     #   target -18 LUFS, silence floor -60 (freeze gain in near-silence, no pump),
-    #   max amp +12 dB (don't lift a quiet app's noise floor), 1 s long period
+    #   max amp +12 dB (don't lift a quiet app's noise floor), 3 s long period
     #   (slow, smooth), long grow/fall 4 (symmetric, ~12.6 dB/s) so leveling
     #   drifts rather than flinches; BOTH short paths disabled (2026-08-28: the
     #   short fall at 6 dB per ~9 ms gutted transients mid-bang — "loud sounds
@@ -273,7 +273,7 @@ pipewire-screenaudio:
                   "Level drift (dB)" = 6.0;
                   "Enable maximum amplification gain limitation" = 1.0;
                   "The maximum amplification gain (dB)" = 12.0;
-                  "Loudness measuring long period (ms)" = 1000.0;
+                  "Loudness measuring long period (ms)" = 3000.0;
                   "Long gain grow amount" = 4.0;
                   "Long gain fall amount" = 4.0;
                   "Short gain grow amount" = 0.0;

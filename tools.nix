@@ -908,16 +908,40 @@ let
       printf 'sys|%s|%s|%s\n' "$1" "$sysexe" "$pid"
     }
 
-    # Source indices that are playback monitors (NOT real mics), from the
-    # server-side topology — not the spoofable client `stream.monitor` flag.
-    monitors=$(pactl list sources 2>/dev/null | awk '
-      /^Source #/                 { idx = substr($2, 2) }
-      /^[[:space:]]*Name:/        { if ($2 ~ /\.monitor$/) print idx }
-      /Monitor of Sink:/          { if ($0 !~ /n\/a/) print idx }
+    # Allowlist of source indices that are GENUINE microphone inputs, resolved
+    # from server-side topology by the source's own node name (never a client-
+    # set string). A capture is a real mic user ONLY if its Source: index is in
+    # here. This is the primary, fail-closed gate: anything not enumerated as a
+    # mic source — the sentinel 4294967295 (a --monitor-stream tap on a sink,
+    # e.g. the balance daemon's post-leveller readers), any `.monitor`, a
+    # monitor of a null/virtual sink, or any not-yet-known plumbing — is simply
+    # absent and therefore never counted, without having to be denylisted first.
+    #
+    # "Genuine mic input" = a real capture device (alsa_input./bluez_input.,
+    # excluding the snd_aloop guest-gaming loopback which is playback fed back
+    # in) OR one of the internal virtual sources that carries real mic audio and
+    # is what normal apps actually capture: the RNNoise source (the denoised
+    # default), the mic-blend combiner, the mix/cast-sync `delayed.<mic>`
+    # wrappers, and consumed remote mics from the tailnet mesh (tailnet-rmic-).
+    mic_sources=$(pactl list sources 2>/dev/null | awk '
+      /^Source #/          { idx = substr($2, 2) }
+      /^[[:space:]]*Name:/ {
+        name = $2
+        if (name ~ /\.monitor$/)       next   # any monitor is not a mic
+        if (name ~ /platform-snd_aloop/) next  # loopback, played-audio fed back
+        ok = 0
+        if (name ~ /^alsa_input\./)    ok = 1   # physical capture device
+        if (name ~ /^bluez_input\./)   ok = 1   # bluetooth mic
+        if (name == "rnnoise_source")  ok = 1   # denoised default source
+        if (name == "combined_mics")   ok = 1   # mic-blend combiner
+        if (name ~ /^delayed\./)       ok = 1   # mix/cast-sync mic wrappers
+        if (name ~ /^tailnet-rmic-/)   ok = 1   # consumed remote mesh mic
+        if (ok) print idx
+      }
     ' | sort -u)
 
-    is_monitor() {
-      for m in $monitors; do [ "$m" = "$1" ] && return 0; done
+    is_mic_source() {
+      for m in $mic_sources; do [ "$m" = "$1" ] && return 0; done
       return 1
     }
 
@@ -987,7 +1011,8 @@ let
     # "yes" if $1 belongs to the balance daemon's user service. Its slot
     # loudness readers capture applvl monitors — playback, never mic — but
     # while the daemon rewires slots a reader's Source transiently reads
-    # unattached, dodging is_monitor and flashing the mic-in-use indicator.
+    # unattached, which the mic-source allowlist already drops; this is the
+    # cgroup-proven belt-and-braces on top.
     # Cgroup-proven, same trust model as is_assistant/is_replay_gsr.
     is_balance() {
       p="$1"
@@ -1016,20 +1041,22 @@ let
         END { flush() }
       ' | while IFS="$SEP" read -r id src corked pid appname medianame nodename client; do
         [ "$corked" = "yes" ] && continue
-        is_monitor "$src" && continue
-        # Direct sink-input taps (parec --monitor-stream=N, e.g. the balance
-        # daemon's post-leveller readers) report Source: 4294967295 (invalid
-        # index) — they capture PLAYBACK audio straight off a sink-input, never
-        # a mic, so the monitor filter above can't catch them. Server-side
-        # field; a real mic capture always carries a valid source index.
-        [ "$src" = "4294967295" ] && continue
-        # A capture with NO attached source ("n/a" — mid-move/reconnect, e.g.
-        # while the balance daemon rewires slots) is hearing nothing; counting
-        # it flashes the indicator for a frame. Dropped in both modes.
-        [ "$src" = "n/a" ] && continue
+        # PRIMARY GATE (fail-closed): count a capture as a mic user ONLY when its
+        # Source: index resolves to a genuine mic input in the allowlist above.
+        # This drops, without needing to be denylisted:
+        #  - `.monitor` sources and null/virtual-sink monitors (playback taps),
+        #  - the sentinel Source: 4294967295 — a `parec --monitor-stream=N` tap
+        #    bound to a sink-input by index (e.g. the balance daemon's post-
+        #    leveller loudness readers). It has no valid source index at all, so
+        #    it can never be in the allowlist. Reads PLAYBACK, never a mic.
+        #  - Source: n/a (mid-move/reconnect — hearing nothing for that frame),
+        #  - any not-yet-known plumbing (a new virtual sink's monitor, etc.).
+        # The index and the source's node name are BOTH server-side topology;
+        # a real mic capture always resolves to a real capture-device source.
+        is_mic_source "$src" || continue
         # The balance daemon's own loudness readers (cgroup-proven) — belt and
-        # braces on top of the source checks, since its readers are the ones
-        # that transiently detach.
+        # braces on top of the allowlist gate, since a reader can transiently
+        # detach/re-attach while the daemon rewires slots.
         is_balance "$pid" && { sys_row "loudness meter (balance)"; continue; }
         # Our own bar level meter (qs-mic-level) and per-mic VAD taps (qs-vad) —
         # never count them as mic users.
@@ -1056,8 +1083,9 @@ let
         # always listening by design, so it shouldn't read as an app actively
         # using the mic — but only skip it when it's PROVABLY the real recorder
         # (cgroup + exe), so nothing can hide behind its name. gsr names its mic
-        # node "gsr-default_input"; its default_output capture is a monitor and
-        # is already dropped by is_monitor above.
+        # node "gsr-default_input" (a real capture bound to a mic source, so the
+        # allowlist keeps it here); its default_output capture is a monitor and
+        # is already dropped by the mic-source allowlist above.
         case "$nodename" in gsr-*)
           is_replay_gsr "$pid" && { sys_row "replay buffer (gsr)"; continue; } ;;
         esac
