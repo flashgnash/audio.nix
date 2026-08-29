@@ -60,6 +60,93 @@ let
       if (label != "") return label
       return _truncate_chars(desc, 8)
     }
+    # ── Canonical internal-node filter ──────────────────────────────────
+    # THE single authority on which node names are our own audio plumbing
+    # and must never surface as a selectable device, mixer row or mic
+    # user. Every lister calls this instead of keeping a private mask, so
+    # a new internal node gets added HERE (plus the python twin the
+    # audio-devices daemon keeps: _VIRT_SINK_RE/_VIRT_SRC_RE + entry
+    # guards in hm-modules/phone-mic/audio_devices.py) and every
+    # enumeration path agrees at once.
+    #
+    # Deliberately NOT matched here, because a bare name cannot decide:
+    #  - tailnet-out-*: the route-PROXY sink is internal but shares the
+    #    prefix with the user-facing phone-speaker sink; the discriminator
+    #    is the tailnet_audio.route property (list-sinks keeps that
+    #    property check alongside this filter).
+    #  - soundboard / tailnet-route-recv: app-like playback streams that
+    #    are deliberately visible in the app mixer (named so they read
+    #    sensibly there).
+    #  - gsr-*: only internal when cgroup+exe prove the real replay
+    #    buffer recorder — audio-mic-users keeps its proof-based check
+    #    (a name-only mask would let anything hide behind the name).
+    function internal_node(name) {
+      # rnnoise filter-chain: the virtual Noise Canceling Source and its
+      # passive capture stream — represented by the noise-cancel toggle.
+      if (name == "rnnoise_source") return 1
+      if (name ~ /^capture\.rnnoise_source/) return 1
+      # mic-blend combiner (Combined Microphones) and its per-mic capture
+      # streams (capture.combined_mics*, uniquified by PipeWire) — the
+      # input MIX toggle is the representation.
+      if (name == "combined_mics") return 1
+      if (name ~ /^capture\.combined_mics/) return 1
+      # output duplicator (module-combine-sink) and its per-slave
+      # playback streams — the output MIX toggle / dup-sink mixer rows.
+      if (name == "combined_out") return 1
+      if (name ~ /^output\.combined_out/) return 1
+      # per-app balance pool: applvl.<n> leveler sinks and applvl.<n>.out
+      # bridge streams (see balance_daemon.py) — parked on, never picked.
+      if (name ~ /^applvl\./) return 1
+      # mix-sync / cast-sync fixed-delay wrappers (delayed.<node>) plus
+      # the pw-loopback instances behind them: sync.<mic>, castsync.<sink>
+      # and bare pw-loopback fallback names — represented by the real
+      # device they wrap.
+      if (name ~ /^delayed\./) return 1
+      if (name ~ /^sync\./ || name ~ /^castsync\./) return 1
+      if (name ~ /^pw-loopback/) return 1
+      # kernel snd_aloop card (guest-gaming plumbing): the input half
+      # would pipe played audio into the mic mix, the output half must
+      # never receive mirrored audio. Substring match — covers both the
+      # alsa_input. and alsa_output. halves (Loopback Analog Stereo).
+      if (name ~ /platform-snd_aloop/) return 1
+      # chromecast plumbing: castaudio_<dev> (audio-cast null-sink) and
+      # cast_<dev> (screen-mirror capture sink) — the cast UI / device
+      # row is the representation.
+      if (name ~ /^castaudio_/ || name ~ /^cast_/) return 1
+      # tailnet-audio mic plumbing: donation null-sink (tailnet-mic-),
+      # mic-consume receiver null-sink (tailnet-inmic-) and the consumed
+      # remote-mic remap source (tailnet-rmic-, shown as its mesh row).
+      # tailnet-out-* is NOT matched — see the header above.
+      if (name ~ /^tailnet-mic-/ || name ~ /^tailnet-inmic-/ || name ~ /^tailnet-rmic-/) return 1
+      # every sink grows a PipeWire monitor source (combined_out.monitor,
+      # castaudio_*.monitor, ...) — captured internally by cast/tailnet/
+      # balance readers, never a mic row.
+      if (name ~ /\.monitor$/) return 1
+      # our own meter/calibration capture streams: bar level meter,
+      # per-mic VAD taps, mix-sync calibration recorders.
+      if (name == "qs-mic-level" || name == "qs-vad" || name == "mix-sync-cal") return 1
+      # venmic virtual mic that exists only while a Discord screen share
+      # captures audio (QuickScreenShare) — never a device or mic user.
+      if (name == "vencord-screen-share") return 1
+      return 0
+    }
+  '';
+
+  # The canonical filter as a bin, for sites that cannot embed the awk
+  # library (python daemons, other nix modules like guest-gaming.nix).
+  #   audio-internal-node <name>   → exit 0 if <name> is internal plumbing
+  #   audio-internal-node          → filter stdin (one node name per line),
+  #                                  printing only the NON-internal ones
+  internal-node-sh = pkgs.writeShellScriptBin "audio-internal-node" ''
+    if [ $# -gt 0 ]; then
+      printf '%s\n' "$1" | ${pkgs.gawk}/bin/awk '
+        ${audio-naming-awk}
+        { exit internal_node($0) ? 0 : 1 }'
+    else
+      ${pkgs.gawk}/bin/awk '
+        ${audio-naming-awk}
+        !internal_node($0) { print }'
+    fi
   '';
 
   # Connects a BT device by MAC and then sets it as the default sink or source
@@ -87,27 +174,18 @@ let
     pactl list sinks | awk -v def="$default" '
       ${audio-naming-awk}
       function emit(    bt, cur) {
-        # combined_out (output duplicator) is represented by the MIX toggle,
-        # not a device row.
-        if (name == "combined_out") return
-        # tailnet-audio mic-donation plumbing: a null-sink whose monitor becomes a
-        # donated mic source. The phone-SPEAKER sink is tailnet-out-<host> and DOES
-        # belong here (a usable output = your phone).
-        if (name ~ /^tailnet-mic-/) return
+        # Internal plumbing never gets a device row — the canonical
+        # internal_node() mask decides (combined_out → the MIX toggle,
+        # cast/tailnet null-sinks → their cast/mesh rows, delay wrappers →
+        # the real sink they wrap, applvl pool, snd_aloop). The phone-
+        # SPEAKER sink tailnet-out-<host> is NOT internal and DOES belong
+        # here (a usable output = your phone).
+        if (internal_node(name)) return
         # Local PROXY sinks for a REMOTE output are represented by their remote
-        # device row (tailnet/cast), so hide the proxy to avoid a duplicate: the
-        # route proxy carries tailnet_audio.route, and cast proxies are cast*_ .
+        # device row; the NAME alone cannot tell a route proxy from the
+        # user-facing phone-speaker sink (both tailnet-out-*), so this one
+        # stays a property check: route proxies carry tailnet_audio.route.
         if (is_route) return
-        if (name ~ /^castaudio_/ || name ~ /^cast_/) return
-        # cast-sync delay wrappers (delayed.<sink> + bare pw-loopback nodes) are
-        # internal plumbing: they interpose a fixed delay in front of a real sink
-        # to time-align it with a cast, and are represented by that real sink.
-        if (name ~ /^delayed\./ || name ~ /^pw-loopback/) return
-        # snd_aloop loopback ("Loopback Analog Stereo", guest-gaming plumbing)
-        # is internal, never user-selectable — same rule as list-sources.
-        if (name ~ /platform-snd_aloop/) return
-        # applvl.* = the per-app balance pool (internal leveler sinks).
-        if (name ~ /^applvl\./) return
         bt  = (name ~ /^bluez_/) ? 1 : 0
         cur = (name == def) ? "1" : "0"
         printf "%s|%s|%s|%s\n", name, display_name(port, alsa_card, alsa_device, desc), cur, bt
@@ -182,13 +260,14 @@ let
     pactl list sources | awk -v def="$default" '
       ${audio-naming-awk}
       function emit(    bt, cur) {
-        if (name == "" || name ~ /\.monitor$/ || name == "rnnoise_source" || name == "combined_mics") return
-        # our own virtual plumbing: audio-mix-sync delay wrappers (delayed.<mic>
-        # + any bare pw-loopback nodes) and the snd_aloop loopback device
-        # ("Loopback Analog Stereo", guest-gaming plumbing) are internal,
-        # never user-selectable
-        if (name ~ /^delayed\./ || name ~ /^pw-loopback/) return
-        if (name ~ /platform-snd_aloop/) return
+        if (name == "") return
+        # Internal plumbing never gets a mic row — the canonical
+        # internal_node() mask decides (monitors, rnnoise_source — the
+        # noise-cancel toggle, already resolved to its feed mic above —,
+        # combined_mics, delay wrappers + loopbacks, snd_aloop, tailnet
+        # mic plumbing incl. tailnet-rmic- consumed-mic remaps which show
+        # as their mesh row instead, venmic screen-share source).
+        if (internal_node(name)) return
         bt  = (name ~ /^bluez_/) ? 1 : 0
         cur = (name == def) ? "1" : "0"
         # 5th field: bar-style short name, for the per-mic bar widgets
@@ -244,8 +323,11 @@ let
     if [ "$default" = "combined_out" ]; then
       prev=$(cat "$prevfile" 2>/dev/null)
       pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF "$prev" || prev=""
+      # First real output as a fallback restore target — the canonical
+      # internal_node() mask keeps snd_aloop and friends out of the running.
       [ -z "$prev" ] && prev=$(pactl list short sinks 2>/dev/null | awk '
-        $2 ~ /^(alsa_output|bluez_output)/ && $2 !~ /snd_aloop/ { print $2; exit }')
+        ${audio-naming-awk}
+        $2 ~ /^(alsa_output|bluez_output)/ && !internal_node($2) { print $2; exit }')
       [ -z "$prev" ] && { echo "no sink to restore"; exit 1; }
       pactl set-default-sink "$prev"
       # Unload our combine sink (streams move back with the default swap
@@ -294,8 +376,17 @@ let
     # — they are the network-buffered references everything else aligns to.
     sync_on=1
     [ -f "''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/disabled" ] && sync_on=0
+    # Slave candidates: everything real, PLUS the two internal families that
+    # ARE legitimate combine members and so get carved back in — delayed.<sink>
+    # cast-sync wrappers (substituted for their real sink below) and cast
+    # proxies (castaudio_/cast_, the cast IS a mix member). The rest of the
+    # canonical internal_node() mask must never be slaved: combined_out itself,
+    # the applvl pool, snd_aloop (mirroring into it would pipe host audio into
+    # the guest capture side) and the tailnet mic sinks (mirroring into a
+    # donated/consumed mic would echo output into that mic).
     present=$(pactl list short sinks 2>/dev/null | awk '
-      $2 != "combined_out" && $2 !~ /platform-snd_aloop/ && $2 !~ /^applvl\./ { print $2 }')
+      ${audio-naming-awk}
+      $2 ~ /^(delayed\.|castaudio_|cast_)/ || !internal_node($2) { print $2 }')
     # Mix-set entries to fold in: the configured .sinks[], or — when empty ("all
     # sinks" mode) — every present sink, run through the SAME loop below so the
     # cast-sync delay substitution applies in all-sinks mode too.
@@ -339,9 +430,12 @@ let
     slaves=$(${mixset-slaves-sh}/bin/audio-mixset-slaves)
     [ -z "$slaves" ] && exit 0
     safe=$(cat "$XDG_RUNTIME_DIR/qs-outdup-prev" 2>/dev/null)
+    # Same fallback rule as outdup-toggle: first real output, with the
+    # canonical internal_node() mask keeping snd_aloop and friends out.
     pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qxF "$safe" || \
       safe=$(pactl list short sinks 2>/dev/null | awk '
-        $2 ~ /^(alsa_output|bluez_output)/ && $2 !~ /snd_aloop/ { print $2; exit }')
+        ${audio-naming-awk}
+        $2 ~ /^(alsa_output|bluez_output)/ && !internal_node($2) { print $2; exit }')
     [ -n "$safe" ] && pactl set-default-sink "$safe"
     pactl list short modules 2>/dev/null \
       | awk '$2 == "module-combine-sink" && $0 ~ /sink_name=combined_out/ { print $1 }' \
@@ -362,9 +456,14 @@ let
   list-dup-sinks-sh = pkgs.writeShellScriptBin "audio-list-dup-sinks" ''
     sinks=$(pactl list sinks | awk '
       ${audio-naming-awk}
-      # snd_aloop and the applvl balance pool are excluded from the combine
-      # slaves; drop them here too so internal plumbing never grows a mixer row.
-      function emit() { if (name != "" && name !~ /platform-snd_aloop/ && name !~ /^applvl\./) printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
+      # This lookup map deliberately keeps the two internal families that ARE
+      # legitimate combine members (mirroring the mixset-slaves carve-out):
+      # delayed.<sink> cast-sync wrappers (re-labelled to the real device
+      # below) and cast proxies (castaudio_/cast_). Everything else in the
+      # canonical internal_node() mask is dropped so internal plumbing —
+      # which mixset-slaves refuses to slave anyway — never grows a mixer row.
+      function keep(n) { return n ~ /^(delayed\.|castaudio_|cast_)/ || !internal_node(n) }
+      function emit() { if (name != "" && keep(name)) printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
       /^Sink #/ { emit(); idx = substr($2, 2); name=""; desc=""; port=""; alsa_card=""; alsa_device="" }
       /^\tName:/        { name = $2 }
       /^\tDescription:/ { desc = substr($0, index($0, $2)) }
@@ -674,7 +773,10 @@ let
   # shows on its Recording tab.
   list-blend-mics-sh = pkgs.writeShellScriptBin "audio-list-blend-mics" ''
     # idx|name|display for every source, to resolve each combiner stream's
-    # "Source:" index into the mic behind it.
+    # "Source:" index into the mic behind it. Deliberately NOT run through
+    # internal_node(): this map is lookup-only (rows are bounded by what
+    # capture.combined_mics* actually captures) and it MUST contain the
+    # delayed.* wrappers so they can be unwrapped to the real mic below.
     sources=$(pactl list sources | awk '
       ${audio-naming-awk}
       function emit() { if (name != "") printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
@@ -1244,19 +1346,30 @@ let
                                  capture_output=True, text=True, timeout=5).stdout
         except Exception:
             return []
-        names = []
+        cand = []
         for line in out.splitlines():
             parts = line.split()
             if len(parts) >= 2:
                 n = parts[1]
-                if (n != RN_SOURCE and n != "combined_mics"
-                        and not n.endswith(".monitor")
-                        and not n.startswith("delayed.")      # mix-sync wrappers
-                        and not n.startswith("pw-loopback")
-                        and not n.startswith("tailnet-")       # network mic proxies
-                        and "platform-snd_aloop" not in n):   # (consume/donation) — never a VAD candidate; guest plumbing
-                    names.append(n)
-        return names
+                # Site EXTRA on top of the canonical filter: ALL tailnet-*
+                # sources — donated phone mics included — are excluded as VAD
+                # candidates, because auto-mic must never yank the default
+                # onto a network mic on its own.
+                if not n.startswith("tailnet-"):
+                    cand.append(n)
+        # The canonical internal-node filter (internal_node() in the shared
+        # audio-naming-awk, exposed as the audio-internal-node bin): monitors,
+        # rnnoise/combined virtuals, delay wrappers, loopbacks, snd_aloop...
+        # On a (should-never-happen) helper failure return NO candidates
+        # rather than unfiltered ones — selecting plumbing would be worse
+        # than briefly standing still.
+        try:
+            r = subprocess.run(["${internal-node-sh}/bin/audio-internal-node"],
+                               input="\n".join(cand), capture_output=True,
+                               text=True, timeout=5)
+            return [n for n in r.stdout.splitlines() if n]
+        except Exception:
+            return []
 
     class Meter:
         """One VAD meter subprocess per mic; a thread folds its `speech snr level`
@@ -1938,6 +2051,7 @@ let
         done > "$namesfile"
 
     pactl list sink-inputs | awk -v tf="$titlesfile" -v nf="$namesfile" '
+      ${audio-naming-awk}
       BEGIN {
         while ((getline line < tf) > 0) {
           idx = index(line, "\001")
@@ -1950,13 +2064,15 @@ let
         }
         close(nf)
       }
-      # The output duplicator per-sink playback streams (from the combine
-      # sink the MIX toggle loads on demand) are not apps — they get their
-      # own rows in the dup-sink mixer of the popup instead.
+      # Internal plumbing streams are not apps — the canonical internal_node()
+      # mask hides them: output.combined_out* duplicator streams get their own
+      # rows in the dup-sink mixer of the popup, applvl.<n>.out balance-pool
+      # bridges would show as phantom "Unknown" gauges, and the sync/castsync
+      # loopback playback halves are represented by their device rows. Streams
+      # that are deliberately app-LIKE (soundboard, tailnet-route-recv) are
+      # not in the mask and keep their gauges.
       function emit() {
-        # applvl.<n>.out are the balance-pool bridge streams (see balance_daemon),
-        # not apps — hide them or they show as phantom "Unknown" gauges.
-        if (id == "" || nodename ~ /^output\.combined_out/ || nodename ~ /^applvl\./) return
+        if (id == "" || internal_node(nodename)) return
         title = (pid in titles) ? titles[pid] : ""
         if (pid in enames) name = enames[pid]
         printf "%s|%s|%s|%s|%s|%s|%s\n", id, name, vol, muted, binary, corked, title
@@ -2508,6 +2624,7 @@ let
   '';
 
   tools = [
+    internal-node-sh
     balance-daemon-sh
     balance-read-sh
     balance-gains-sh
@@ -2575,12 +2692,16 @@ let
 in
 rec {
   # Individual script derivations, for wiring into services etc.
+  # internal-node-sh is exported so OTHER modules (e.g. guest-gaming.nix)
+  # can apply the one canonical internal-node filter instead of keeping
+  # their own copy of the mask.
   inherit
     audio-xrun-guard-sh
     auto-mic-daemon-sh
     mix-sync-daemon-sh
     cast-sync-daemon-sh
     balance-daemon-sh
+    internal-node-sh
     ;
 
   # Everything on PATH: audio-* tools + the audioctl dispatcher.
