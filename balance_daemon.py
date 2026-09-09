@@ -20,6 +20,14 @@ Design (why this is safe and lossless):
     the balance gain lives INSIDE the filter-chain, a separate float multiply, so
     enabling balancing never clobbers existing per-app volume settings.
 
+This daemon also owns per-stream FX pinning (audio-streamfx): rules in
+~/.config/audio-streamfx/rules.json pin an app's streams onto one of the static
+`strmfx.<preset>` filter sinks (99-stream-fx in pipewire.nix). It lives here —
+not in a separate daemon — because exactly ONE mover may own sink-input
+placement, or the two reconcilers race each other over the same streams.
+Fx-pinned streams are excluded from the balance pool and published as extra
+rows (with an "fx" field) so the gauges can show/drive them the same way.
+
 The daemon is event-driven (pactl subscribe), never polls the graph. It publishes
 the applied per-slot gain for the bar to draw the "balance adjustment" arc:
   ~/.local/state/qs-audio/balance.json
@@ -70,9 +78,23 @@ TRIMS_FILE = os.path.join(STATE_DIR, "balance-trims.json")
 NSLOTS = int(os.environ.get("BALANCE_SLOTS", "4"))
 SLOT_SINKS = ["applvl.%d" % i for i in range(NSLOTS)]
 
-# Streams we must never try to balance: the balance sinks' own outputs, and the
-# other virtual plumbing that shows up as sink-inputs.
-_SKIP_STREAM_RE = re.compile(r"^(applvl\.|tailnet-|combined_)")
+# Per-stream FX presets: pinnable filter-chain sinks (99-stream-fx in
+# pipewire.nix). Rules ({app key: preset}) are written by audio-streamfx; this
+# daemon owns ALL sink-input placement, so fx pinning lives here too — a
+# separate mover would race the balance reconcile over the same streams.
+# FX pinning works regardless of whether balancing is enabled; fx-pinned
+# streams are excluded from the balance pool (the voice preset carries its own
+# leveler).
+FX_CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "audio-streamfx", "rules.json",
+)
+FX_PRESETS = {"voice": "strmfx.voice", "bass": "strmfx.bass"}
+FX_SINKS = set(FX_PRESETS.values())
+
+# Streams we must never try to balance: the balance/fx sinks' own outputs, and
+# the other virtual plumbing that shows up as sink-inputs.
+_SKIP_STREAM_RE = re.compile(r"^(applvl\.|strmfx\.|tailnet-|combined_)")
 
 
 def sh(*args, timeout=10):
@@ -93,6 +115,17 @@ def load_config():
         }
     except Exception:
         return {"output_enabled": False, "input_enabled": False}
+
+
+def load_fx_rules():
+    """{app key: preset} — only presets we actually have a sink for."""
+    try:
+        with open(FX_CONFIG) as f:
+            c = json.load(f)
+        return {str(k).lower(): str(v) for k, v in c.items()
+                if str(v) in FX_PRESETS}
+    except Exception:
+        return {}
 
 
 # ------------------------------------------------------------------- pactl parse
@@ -164,7 +197,14 @@ def app_key(si):
     """Stable per-app grouping key (mirrors the bar's per-app gauges). This is the
     key the reconcile trims/publishes under: binary-first and lowercased so it's
     stable across runs, but for the shared Electron/Chromium launcher we fall back
-    to the app/node name so two distinct Electron apps don't collide on one trim."""
+    to the app/node name so two distinct Electron apps don't collide on one trim.
+    Per-user Discord bridge streams (PerUserAudioSinks: discordpeer.<id>.out)
+    key on their node.name FIRST — their owning binary is pipewire-pulse, which
+    would collapse every participant onto one key. Mirrored in the awk resolver
+    inside audio-streamfx (tools.nix)."""
+    nn = (si.get("node_name") or "").lower()
+    if nn.startswith("discordpeer."):
+        return nn
     b = (si.get("binary") or "").lower()
     if b in ("", "electron", "chromium"):
         return (si.get("appname") or si.get("node_name") or "app").lower()
@@ -306,15 +346,16 @@ def _move(stream_id, sink_name):
 # whenever a slot is handed to a different stream (so a new stream never inherits
 # the previous one's trim), and reads it back to publish for the gauge.
 _slot_stream = {}       # slot -> stream id it was last (re)set for
+_fx_streams = {}        # fx sink -> "id,id,..." signature of the streams pinned to it
 
 
 def _applvl_out_ids():
-    """slot node.name -> the sink-input id of its '<slot>.out' playback bridge."""
+    """slot/fx-sink node.name -> the sink-input id of its '<name>.out' bridge."""
     out = {}
     try:
         for si in list_sink_inputs():
             nn = si.get("node_name", "")
-            if nn.endswith(".out") and nn[:-4] in SLOT_SINKS:
+            if nn.endswith(".out") and (nn[:-4] in SLOT_SINKS or nn[:-4] in FX_SINKS):
                 out[nn[:-4]] = si["id"]
     except Exception:
         pass
@@ -350,10 +391,11 @@ def reconcile():
 
 
 def _disable_cleanup():
-    """One-shot teardown when balancing goes off: evict anything still parked on a
-    slot back to the default sink and reset the post-leveler trims so nothing is
-    left attenuated. Only worth its pactl cost when we actually held state — the
-    caller gates on that so idle-disabled ticks never reach here."""
+    """One-shot teardown when balancing goes off AND no fx rules remain: evict
+    anything still parked on a slot or fx sink back to the default sink and
+    reset the post-filter trims so nothing is left attenuated. Only worth its
+    pactl cost when we actually held state — the caller gates on that so
+    idle-disabled ticks never reach here."""
     dflt = default_sink()
     sink_name = _sink_index_to_name()
     out_ids = _applvl_out_ids()
@@ -363,26 +405,29 @@ def _disable_cleanup():
         streams = []
     for si in streams:
         cur = sink_name.get(si.get("sink_index", ""), "")
-        if cur in SLOT_SINKS and dflt and not _SKIP_STREAM_RE.match(si.get("node_name", "")):
+        if (cur in SLOT_SINKS or cur in FX_SINKS) and dflt \
+                and not _SKIP_STREAM_RE.match(si.get("node_name", "")):
             _move(si["id"], dflt)
-    for slot in SLOT_SINKS:
+    for slot in list(SLOT_SINKS) + sorted(FX_SINKS):
         _set_out_vol(slot, 100, out_ids)
     _assign.clear()
     _slot_stream.clear()
+    _fx_streams.clear()
     _set_output_rows([])
 
 
 def _reconcile_locked():
-    global _last_published
-    # Balancing off is the DEFAULT — bail before ANY pactl/subprocess call so the
-    # ticker (and every subscribe wake) costs nothing on an idle desktop. Only when
-    # we still hold in-memory assignments (i.e. we just transitioned enabled→
-    # disabled) do we pay for the one-shot cleanup, which then empties that state so
-    # subsequent disabled ticks return here immediately. Re-enabling is unaffected:
-    # the config-change signal / subscribe thread re-triggers reconcile and this
-    # guard falls through once output_enabled flips back on.
-    if not load_config()["output_enabled"]:
-        if _assign or _slot_stream:
+    # Everything off is the DEFAULT — bail before ANY pactl/subprocess call so
+    # the ticker (and every subscribe wake) costs nothing on an idle desktop.
+    # Only when we still hold in-memory state (i.e. we just transitioned to
+    # all-off) do we pay for the one-shot cleanup, which then empties that
+    # state so subsequent disabled ticks return here immediately. Re-enabling
+    # is unaffected: the config-change signal / subscribe thread re-triggers
+    # reconcile and this guard falls through.
+    enabled = load_config()["output_enabled"]
+    fx_rules = load_fx_rules()
+    if not enabled and not fx_rules:
+        if _assign or _slot_stream or _fx_streams:
             _disable_cleanup()
         return
 
@@ -391,6 +436,105 @@ def _reconcile_locked():
     except Exception:
         return  # transient pactl failure — keep current assignment
     sink_name = _sink_index_to_name()
+    dflt = default_sink()
+
+    streams_by_id = {}          # sink-input id -> stream (real app streams only)
+    for si in streams:
+        if _SKIP_STREAM_RE.match(si.get("node_name", "")):
+            continue
+        # Streams the PerUserAudioSinks Vesktop plugin routed onto a per-user
+        # null-sink (discord_user_<id>) are pinned there BY the app — moving
+        # them would collapse the per-user split. The user's balanceable/
+        # filterable stream is that sink's discordpeer.<id>.out bridge, which
+        # sits on a real output and flows through here normally.
+        if sink_name.get(si.get("sink_index", ""), "").startswith("discord_user_"):
+            continue
+        streams_by_id[si["id"]] = si
+
+    with _slot_gain_lock:
+        gains = dict(_slot_gain)
+        gains_db = dict(_slot_gain_db)
+    out_ids = _applvl_out_ids()
+    trims_dirty = False
+
+    # ---- FX pinning (independent of balancing) -----------------------------
+    # A rule pins EVERY stream of the app onto the preset's sink; several
+    # streams (or even apps) sharing a preset simply mix before the filter.
+    # Unlike balance slots (one stream per leveler for correctness), that
+    # mixing is exactly what you want for e.g. a multi-stream Discord call.
+    fx_by_sink = {}             # fx sink -> [stream ids, ascending]
+    for sid in sorted(streams_by_id, key=int):
+        preset = fx_rules.get(app_key(streams_by_id[sid]))
+        if preset:
+            fx_by_sink.setdefault(FX_PRESETS[preset], []).append(sid)
+    fx_ids = set()
+    for fsink, sids in fx_by_sink.items():
+        for sid in sids:
+            fx_ids.add(sid)
+            cur = sink_name.get(streams_by_id[sid].get("sink_index", ""), "")
+            if cur != fsink:
+                _move(sid, fsink)
+    # Evict streams squatting on an fx sink they're not pinned to (rule
+    # removed, or WirePlumber's stream-target restore respawning a stream
+    # straight onto the sink). Balance re-homes its own assignees below.
+    if dflt:
+        for sid, si in streams_by_id.items():
+            if sid in fx_ids:
+                continue
+            if sink_name.get(si.get("sink_index", ""), "") in FX_SINKS:
+                _move(sid, dflt)
+
+    fx_rows = []
+    for fsink in sorted(fx_by_sink):
+        sids = fx_by_sink[fsink]
+        key = app_key(streams_by_id[sids[0]])
+        sig = ",".join(sids)
+        # New pinning on this sink? Apply the app's saved post-filter trim —
+        # the SAME per-app store as the balance trims, so the user's gauge
+        # setting carries over when fx toggles on/off or slots reshuffle.
+        if _fx_streams.get(fsink) != sig:
+            _fx_streams[fsink] = sig
+            offset = _trims.get(key, 100)
+            _set_out_vol(fsink, offset, out_ids)
+        else:
+            offset = _get_sinkinput_vol(out_ids.get(fsink)) if fsink in out_ids else 100
+            if offset is None:
+                offset = 100
+            if offset != _trims.get(key, 100):
+                if offset == 100:
+                    _trims.pop(key, None)
+                else:
+                    _trims[key] = offset
+                trims_dirty = True
+        fx_rows.append({"key": key, "ids": [int(s) for s in sids],
+                        "gain": gains.get(fsink, 100),
+                        "gain_db": round(gains_db.get(fsink, 0.0), 1),
+                        "offset": offset, "slot": fsink,
+                        "fx": fsink.split(".", 1)[1]})
+    # Freed fx sinks: reset the bridge trim so the next pinning starts clean.
+    for fsink in list(_fx_streams):
+        if fsink not in fx_by_sink:
+            _fx_streams.pop(fsink)
+            _set_out_vol(fsink, 100, out_ids)
+
+    # ---- Balancing ---------------------------------------------------------
+    if not enabled:
+        # Balance is off while fx stays active: one-shot eviction of anything
+        # still parked on a slot (enabled→disabled transition), then publish
+        # the fx rows only.
+        if _assign or _slot_stream:
+            for sid, si in streams_by_id.items():
+                cur = sink_name.get(si.get("sink_index", ""), "")
+                if cur in SLOT_SINKS and dflt:
+                    _move(sid, dflt)
+            for slot in SLOT_SINKS:
+                _set_out_vol(slot, 100, out_ids)
+            _assign.clear()
+            _slot_stream.clear()
+        if trims_dirty:
+            _save_trims()
+        _set_output_rows(fx_rows)
+        return
 
     # One slot per STREAM (sink-input), NOT per app. Two streams of the same app
     # — e.g. two browser profiles playing different things — are genuinely
@@ -398,23 +542,19 @@ def _reconcile_locked():
     # binary would collapse both onto one leveler and balance nothing. Keyed by
     # the sink-input id, which is stable for the life of the stream. (Two tabs in
     # ONE browser profile still share a single sink-input — that's the browser
-    # emitting one mixed stream, which we can't split.)
-    streams_by_id = {}          # sink-input id -> stream
-    for si in streams:
-        nn = si.get("node_name", "")
-        if _SKIP_STREAM_RE.match(nn):
-            continue
-        streams_by_id[si["id"]] = si
+    # emitting one mixed stream, which we can't split.) Fx-pinned streams are
+    # not the balancer's to place.
+    bal_streams = {sid: si for sid, si in streams_by_id.items() if sid not in fx_ids}
 
-    # Drop assignments whose stream has gone away.
+    # Drop assignments whose stream has gone away (or got pinned to fx).
     for slot in list(_assign.keys()):
-        if _assign[slot] not in streams_by_id:
+        if _assign[slot] not in bal_streams:
             del _assign[slot]
     assigned_ids = set(_assign.values())
 
     # Assign new streams to free slots.
     free = [s for s in SLOT_SINKS if s not in _assign]
-    for sid in streams_by_id:
+    for sid in bal_streams:
         if sid in assigned_ids:
             continue
         if not free:
@@ -433,7 +573,7 @@ def _reconcile_locked():
     # an UNASSIGNED one (pool full) goes back to the default sink here —
     # unbalanced on the real output, exactly what "no slot" is meant to be.
     if dflt:
-        for sid, si in streams_by_id.items():
+        for sid, si in bal_streams.items():
             if sid in assigned_ids:
                 continue
             cur = sink_name.get(si.get("sink_index", ""), "")
@@ -442,18 +582,13 @@ def _reconcile_locked():
 
     # Ensure each assigned stream sits on its slot; publish its per-stream gain.
     rows = []
-    with _slot_gain_lock:
-        gains = dict(_slot_gain)
-        gains_db = dict(_slot_gain_db)
-    # Forget cached gains for slots no longer assigned (so a freed slot doesn't
-    # keep a stale value if it's reused).
+    # Forget cached gains for slots no longer assigned/pinned (so a freed slot
+    # doesn't keep a stale value if it's reused).
     for slot in list(_slot_gain.keys()):
-        if slot not in _assign:
+        if slot not in _assign and slot not in _fx_streams:
             with _slot_gain_lock:
                 _slot_gain.pop(slot, None)
                 _slot_gain_db.pop(slot, None)
-    out_ids = _applvl_out_ids()
-    trims_dirty = False
     # Trims are persisted per APP key but slots are per STREAM: with two
     # streams of one app the rows would fight over the single _trims entry
     # every pass (row 1 writes its offset, row 2 deletes it). First row wins.
@@ -495,7 +630,7 @@ def _reconcile_locked():
     for slot in list(_slot_stream.keys()):
         if slot not in _assign:
             _slot_stream.pop(slot, None)
-    _set_output_rows(rows)
+    _set_output_rows(rows + fx_rows)
 
 
 def output_gain_loop():
@@ -505,6 +640,9 @@ def output_gain_loop():
     while True:
         cfg = load_config()
         active = set(_assign.keys()) if cfg["output_enabled"] else set()
+        # fx sinks measure the same way (pre monitor vs .out bridge stream) and
+        # are active whenever something is pinned, balancing on or off.
+        active |= set(_fx_streams.keys())
         # start reader pairs for newly-active slots
         newly = active - set(_slot_readers)
         out_ids = _applvl_out_ids() if newly else {}

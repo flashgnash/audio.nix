@@ -339,6 +339,206 @@ pipewire-screenaudio:
         };
       }) 4;
     };
+
+    # ── Per-stream FX presets: pinnable filter sinks ─────────────────────────
+    # STATIC filter-chain sinks `strmfx.<preset>` a specific app's output can be
+    # pinned to (e.g. put a Discord call on "voice"). Same pattern as the
+    # applvl pool: the balance daemon MOVES the app's sink-inputs here (per the
+    # rules in ~/.config/audio-streamfx/rules.json, set via audio-streamfx) —
+    # it never creates graph nodes, idle sinks suspend (≈free), and the
+    # `strmfx.<preset>.out` playback bridge carries the user's post-filter
+    # volume trim. Masked as internal plumbing everywhere (internal_node()).
+    #
+    # Presets:
+    #   voice — speech clarity for calls: high-pass the sub-voice rumble, lift
+    #           presence, then the proven leveler+limiter pair from the applvl
+    #           pool so quiet talkers come up and nobody clips.
+    #   bass  — low-shelf boost for music, limiter to catch the added peaks.
+    extraConfig.pipewire."99-stream-fx" =
+      let
+        limiter = {
+          type = "ladspa";
+          name = "lim";
+          plugin = "lsp-plugins-ladspa";
+          label = "http://lsp-plug.in/plugins/ladspa/limiter_stereo";
+          control = {
+            # -1 dBFS ceiling: 10^(-1/20) ≈ 0.891 (linear).
+            "Threshold (G)" = 0.891;
+            "Attack time (ms)" = 1.0;
+            "Release time (ms)" = 8.0;
+          };
+        };
+        # Builtin biquads are mono — one node per channel, suffixed _l/_r.
+        biquadPair = name: label: control: side: {
+          type = "builtin";
+          inherit label control;
+          name = "${name}_${side}";
+        };
+        mkFx = preset: desc: graph: {
+          name = "libpipewire-module-filter-chain";
+          # nofail: a plugin load failure must never take down PipeWire.
+          flags = [ "nofail" ];
+          args = {
+            "node.description" = desc;
+            "media.name" = desc;
+            "filter.graph" = graph;
+            "capture.props" = {
+              "node.name" = "strmfx.${preset}";
+              "node.description" = desc;
+              "media.class" = "Audio/Sink";
+              "audio.rate" = 48000;
+              "audio.position" = [
+                "FL"
+                "FR"
+              ];
+            };
+            "playback.props" = {
+              "node.name" = "strmfx.${preset}.out";
+              "audio.rate" = 48000;
+              "audio.position" = [
+                "FL"
+                "FR"
+              ];
+            };
+          };
+        };
+      in
+      {
+        "context.modules" = [
+          (mkFx "voice" "Stream FX: Voice Clarity" {
+            # Tuning history: 110 Hz HPF + a -2.5 dB dip @ 250 Hz "stripped the
+            # bass from voices" (2026-09-09) — male fundamentals live at
+            # 85–180 Hz and the warmth band right above, so both stages ate the
+            # body of the voice. Now: HPF at 80 Hz (below fundamentals, still
+            # kills rumble/handling noise), no mud dip, gentler +3 dB presence.
+            nodes =
+              (map
+                (
+                  side:
+                  # rumble/handling noise below speech fundamentals
+                  biquadPair "hp" "bq_highpass" {
+                    "Freq" = 80.0;
+                    "Q" = 0.707;
+                  } side
+                )
+                [
+                  "l"
+                  "r"
+                ]
+              )
+              ++ (map
+                (
+                  side:
+                  # presence lift — consonant intelligibility
+                  biquadPair "pres" "bq_peaking" {
+                    "Freq" = 2800.0;
+                    "Q" = 0.9;
+                    "Gain" = 3.0;
+                  } side
+                )
+                [
+                  "l"
+                  "r"
+                ]
+              )
+              ++ [
+                {
+                  # Same proven leveler as the applvl pool: quiet talkers rise
+                  # to the target, loud ones settle back — the "compressor" of
+                  # this chain, with the limiter as the safety.
+                  type = "ladspa";
+                  name = "lvl";
+                  plugin = "lsp-plugins-ladspa";
+                  label = "http://lsp-plug.in/plugins/ladspa/autogain_stereo";
+                  control = {
+                    "Desired loudness level (LUFS)" = -18.0;
+                    "The level of silence (LUFS)" = -60.0;
+                    "Level drift (dB)" = 6.0;
+                    "Enable maximum amplification gain limitation" = 1.0;
+                    "The maximum amplification gain (dB)" = 12.0;
+                    "Loudness measuring long period (ms)" = 3000.0;
+                    "Long gain grow amount" = 4.0;
+                    "Long gain fall amount" = 4.0;
+                    "Short gain grow amount" = 0.0;
+                    "Short gain fall amount" = 0.0;
+                    "Weighting function" = 5.0;
+                  };
+                }
+                limiter
+              ];
+            links = [
+              {
+                output = "hp_l:Out";
+                input = "pres_l:In";
+              }
+              {
+                output = "hp_r:Out";
+                input = "pres_r:In";
+              }
+              {
+                output = "pres_l:Out";
+                input = "lvl:Input L";
+              }
+              {
+                output = "pres_r:Out";
+                input = "lvl:Input R";
+              }
+              {
+                output = "lvl:Output L";
+                input = "lim:Input L";
+              }
+              {
+                output = "lvl:Output R";
+                input = "lim:Input R";
+              }
+            ];
+            inputs = [
+              "hp_l:In"
+              "hp_r:In"
+            ];
+            outputs = [
+              "lim:Output L"
+              "lim:Output R"
+            ];
+          })
+          (mkFx "bass" "Stream FX: Bass Boost" {
+            nodes =
+              (map
+                (
+                  side:
+                  biquadPair "bs" "bq_lowshelf" {
+                    "Freq" = 100.0;
+                    "Q" = 0.707;
+                    "Gain" = 6.0;
+                  } side
+                )
+                [
+                  "l"
+                  "r"
+                ]
+              )
+              ++ [ limiter ];
+            links = [
+              {
+                output = "bs_l:Out";
+                input = "lim:Input L";
+              }
+              {
+                output = "bs_r:Out";
+                input = "lim:Input R";
+              }
+            ];
+            inputs = [
+              "bs_l:In"
+              "bs_r:In"
+            ];
+            outputs = [
+              "lim:Output L"
+              "lim:Output R"
+            ];
+          })
+        ];
+      };
   };
 
   environment.systemPackages = with pkgs; [

@@ -97,6 +97,14 @@ let
       # per-app balance pool: applvl.<n> leveler sinks and applvl.<n>.out
       # bridge streams (see balance_daemon.py) — parked on, never picked.
       if (name ~ /^applvl\./) return 1
+      # per-stream fx presets: strmfx.<preset> filter sinks and their .out
+      # bridges (99-stream-fx / audio-streamfx) — pinned to, never picked.
+      if (name ~ /^strmfx\./) return 1
+      # PerUserAudioSinks (Vesktop): per-participant null-sinks — routing
+      # plumbing, never a selectable output. Their discordpeer.<id>.out
+      # bridge streams are deliberately NOT masked: they are the per-user
+      # gauges in the app mixer.
+      if (name ~ /^discord_user_/) return 1
       # mix-sync / cast-sync fixed-delay wrappers (delayed.<node>) plus
       # the pw-loopback instances behind them: sync.<mic>, castsync.<sink>
       # and bare pw-loopback fallback names — represented by the real
@@ -2194,11 +2202,16 @@ let
   list-sink-inputs-sh = pkgs.writeShellScriptBin "audio-list-sink-inputs" ''
     titlesfile=$(mktemp)
     namesfile=$(mktemp)
-    trap "rm -f $titlesfile $namesfile" EXIT
+    sinksfile=$(mktemp)
+    trap "rm -f $titlesfile $namesfile $sinksfile" EXIT
 
     hyprctl clients -j 2>/dev/null \
       | ${pkgs.jq}/bin/jq -r '.[] | [(.pid|tostring), .title] | join("\u0001")' \
       > "$titlesfile" 2>/dev/null || true
+
+    # sink index -> node.name, to hide streams parked on per-user Discord
+    # null-sinks (see the awk below).
+    pactl list short sinks > "$sinksfile" 2>/dev/null || true
 
     # Walk up the process tree to find the root electron/chromium ancestor
     # and identify the real application from its cmdline
@@ -2245,7 +2258,7 @@ let
           esac
         done > "$namesfile"
 
-    pactl list sink-inputs | awk -v tf="$titlesfile" -v nf="$namesfile" '
+    pactl list sink-inputs | awk -v tf="$titlesfile" -v nf="$namesfile" -v sf="$sinksfile" '
       ${audio-naming-awk}
       BEGIN {
         while ((getline line < tf) > 0) {
@@ -2258,24 +2271,34 @@ let
           if (idx > 0) enames[substr(line,1,idx-1)] = substr(line,idx+1)
         }
         close(nf)
+        while ((getline line < sf) > 0) {
+          n = split(line, sp, "\t")
+          if (n >= 2) sinknames[sp[1]] = sp[2]
+        }
+        close(sf)
       }
       # Internal plumbing streams are not apps — the canonical internal_node()
       # mask hides them: output.combined_out* duplicator streams get their own
       # rows in the dup-sink mixer of the popup, applvl.<n>.out balance-pool
       # bridges would show as phantom "Unknown" gauges, and the sync/castsync
       # loopback playback halves are represented by their device rows. Streams
-      # that are deliberately app-LIKE (soundboard, tailnet-route-recv) are
-      # not in the mask and keep their gauges.
+      # that are deliberately app-LIKE (soundboard, tailnet-route-recv,
+      # discordpeer.<id>.out per-user bridges) are not in the mask and keep
+      # their gauges. Vesktop feed streams PARKED on a discord_user_* null-sink
+      # are hidden by their sink: the per-user bridge is that voice, and a
+      # visible feed gauge would fight the split (PerUserAudioSinks).
       function emit() {
         if (id == "" || internal_node(nodename)) return
+        if (sinknames[sinkidx] ~ /^discord_user_/) return
         title = (pid in titles) ? titles[pid] : ""
         if (pid in enames) name = enames[pid]
         printf "%s|%s|%s|%s|%s|%s|%s\n", id, name, vol, muted, binary, corked, title
       }
       /^Sink Input #/ {
         emit()
-        id = substr($3, 2); name = "Unknown"; vol = 100; muted = 0; binary = ""; pid = ""; nodename = ""; corked = 0
+        id = substr($3, 2); name = "Unknown"; vol = 100; muted = 0; binary = ""; pid = ""; nodename = ""; corked = 0; sinkidx = ""
       }
+      /^\tSink:/    { sinkidx = $2 }
       /Corked:/    { corked = ($2 == "yes") ? 1 : 0 }
       /Mute:/      { muted = ($2 == "yes") ? 1 : 0 }
       /Volume:.*%/ { match($0, /[0-9]+%/); if (RSTART > 0) vol = substr($0, RSTART, RLENGTH-1) + 0 }
@@ -2793,13 +2816,14 @@ let
 
   # Live applied gains from the daemon's balance.json, as parseable lines:
   #   range|<lo dB>|<hi dB>   (auto-calibrated arc display range, if known)
-  #   out|<gain%>|<offset%>|<sink-input#>,...|<gain dB>|<slot>   in|<gain%>|<mic node.name>
+  #   out|<gain%>|<offset%>|<sink-input#>,...|<gain dB>|<slot>|<fx preset or ->
+  #   in|<gain%>|<mic node.name>
   balance-gains-sh = pkgs.writeShellScriptBin "audio-balance-gains" ''
     state="''${XDG_STATE_HOME:-$HOME/.local/state}/qs-audio/balance.json"
     [ -f "$state" ] || exit 0
     ${pkgs.jq}/bin/jq -r '
       (if .range then "range|\(.range.lo)|\(.range.hi)" else empty end),
-      (.output[]? | "out|\(.gain)|\(.offset // 100)|" + ((.ids // []) | map(tostring) | join(",")) + "|\(.gain_db // 0)|\(.slot // "")"),
+      (.output[]? | "out|\(.gain)|\(.offset // 100)|" + ((.ids // []) | map(tostring) | join(",")) + "|\(.gain_db // 0)|\(.slot // "")|\(.fx // "-")"),
       (.input[]?  | "in|\(.gain)|\(.key)")
     ' "$state" 2>/dev/null
     exit 0
@@ -2853,13 +2877,108 @@ let
       # index -> name; must be a balance slot
       slot=$(pactl list short sinks | awk -v i="$sidx" '$1==i {print $2}')
     fi
-    case "$slot" in applvl.*) ;; *) exit 0 ;; esac
-    # find the applvl.<n>.out bridge sink-input and set its volume
+    case "$slot" in applvl.*|strmfx.*) ;; *) exit 0 ;; esac
+    # find the slot's .out bridge sink-input and set its volume
     outid=$(pactl list sink-inputs | awk -v n="$slot.out" '
       /^Sink Input #/ { cur=substr($3,2) }
       /node\.name = / { if (index($0, "\"" n "\"")) { print cur; exit } }')
     [ -n "$outid" ] && pactl set-sink-input-volume "$outid" "$pct%"
     echo done
+  '';
+
+  # ── Per-stream FX presets ───────────────────────────────────────────────────
+  # Pin a specific app's output streams onto one of the static strmfx.<preset>
+  # filter sinks (99-stream-fx in pipewire.nix) — e.g. voice-clarity on a
+  # Discord call. Rules are per APP KEY (same derivation as the daemon's
+  # app_key(): lowercased binary, or the app/node name for the shared
+  # electron/chromium launcher) so they survive stream restarts; the balance
+  # daemon applies them (it owns all sink-input placement — see
+  # balance_daemon.py) whether or not balancing is enabled.
+  #   audio-streamfx read                       → "<app key>|<preset>" lines
+  #   audio-streamfx presets                    → "<preset>|<label>" lines
+  #   audio-streamfx <id|key> <preset|off|cycle>  (numeric arg = sink-input id,
+  #                                              resolved to its app key)
+  # cycle order: off → voice → bass → off; the resulting preset is echoed.
+  streamfx-sh = pkgs.writeShellScriptBin "audio-streamfx" ''
+    PATH=${pkgs.pulseaudio}/bin:${pkgs.gawk}/bin:${pkgs.jq}/bin:${pkgs.coreutils}/bin:${pkgs.procps}/bin:$PATH
+    rules="''${XDG_CONFIG_HOME:-$HOME/.config}/audio-streamfx/rules.json"
+    presets="voice bass"
+
+    case "''${1:-}" in
+      presets)
+        echo "voice|voice clarity"
+        echo "bass|bass boost"
+        exit 0 ;;
+      read)
+        [ -f "$rules" ] && jq -r 'to_entries[] | "\(.key)|\(.value)"' "$rules" 2>/dev/null
+        exit 0 ;;
+      "")
+        echo "usage: audio-streamfx <sink-input-id|app-key> <voice|bass|off|cycle> | read | presets" >&2
+        exit 1 ;;
+    esac
+
+    target="$1"; action="''${2:-cycle}"
+    case "$target" in
+      # numeric (or comma-separated) = sink-input id(s) from a gauge; resolve
+      # the daemon's app key from stream properties (binary unless it's the
+      # shared electron/chromium launcher, then the app/node name — MUST
+      # mirror app_key() in balance_daemon.py or a rule set from the UI would
+      # never match). The gauge keeps VANISHED streams visible for a 60s
+      # age-out window, so its id list can contain dead ids that resolve to
+      # nothing — try each id until one yields a real key, and refuse to
+      # write a rule otherwise (a bad key like "app" pins nothing and the
+      # switch just snaps back).
+      *[!0-9,]*) key=$(echo "$target" | tr '[:upper:]' '[:lower:]') ;;
+      *)
+        key=""
+        for id in $(echo "$target" | tr ',' ' '); do
+          k=$(pactl list sink-inputs | awk -v want="$id" '
+            /^Sink Input #/ { if (cur == want) exit; cur = substr($3, 2) }
+            cur != want { next }
+            /application\.process\.binary/ { split($0, a, "\""); bin  = a[2] }
+            /application\.name/            { split($0, a, "\""); app  = a[2] }
+            /node\.name = /                { split($0, a, "\""); node = a[2] }
+            END {
+              # per-user Discord bridge streams key on node.name (their owning
+              # binary is pipewire-pulse — every participant would collide).
+              if (tolower(node) ~ /^discordpeer\./) { print tolower(node); exit }
+              b = tolower(bin)
+              if (b == "" || b == "electron" || b == "chromium") {
+                k = (app != "") ? app : ((node != "") ? node : "")
+              } else k = b
+              print tolower(k)
+            }')
+          [ -n "$k" ] && { key="$k"; break; }
+        done
+        [ -z "$key" ] && { echo "could not resolve an app key from sink-input(s) $target" >&2; exit 1; }
+        ;;
+    esac
+
+    mkdir -p "$(dirname "$rules")"
+    [ -f "$rules" ] || echo '{}' > "$rules"
+    current=$(jq -r --arg k "$key" '.[$k] // "off"' "$rules" 2>/dev/null || echo off)
+
+    if [ "$action" = "cycle" ]; then
+      next=off
+      prev=off
+      for p in $presets; do
+        if [ "$current" = "$prev" ]; then next="$p"; break; fi
+        prev="$p"
+      done
+      # current was the last preset (or unknown) → next stays off
+      action="$next"
+    fi
+
+    tmp=$(mktemp)
+    case "$action" in
+      off) jq --arg k "$key" 'del(.[$k])' "$rules" > "$tmp" ;;
+      voice|bass) jq --arg k "$key" --arg v "$action" '.[$k] = $v' "$rules" > "$tmp" ;;
+      *) rm -f "$tmp"; echo "unknown preset: $action" >&2; exit 1 ;;
+    esac
+    if [ -s "$tmp" ]; then mv "$tmp" "$rules"; else rm -f "$tmp"; fi
+    # Nudge the daemon to apply the rules now (event-driven).
+    pkill -HUP -f balance-daemon.py 2>/dev/null || true
+    echo "$action"
   '';
 
   tools = [
@@ -2869,6 +2988,7 @@ let
     balance-gains-sh
     balance-mutate-sh
     balance-setvol-sh
+    streamfx-sh
     bt-audio-connect-sh
     recency-sh
     default-sink-kind-sh
