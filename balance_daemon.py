@@ -390,6 +390,46 @@ def reconcile():
         _reconcile_locked()
 
 
+# Set by the pactl-subscribe thread on real graph events (vs the 1s ticker):
+# the standalone loop-breaker below runs only on these, so idle ticks stay
+# subprocess-free while any change that could form a loop triggers a check.
+_evt_wake = {"flag": False}
+
+
+def _break_feedback_loops():
+    """Evict any per-user BRIDGE stream sitting on a discord_user_* sink —
+    per-user monitor feeding a per-user sink is a closed feedback loop that
+    screamed at full scale (2026-09-10). Standalone so it protects even while
+    balancing AND fx are OFF (the main reconcile bails early then). Gated on
+    the cheap sink listing: no discord_user sinks, no further work."""
+    r = sh(PACTL, "list", "short", "sinks")
+    if r.returncode != 0 or "discord_user_" not in r.stdout:
+        return
+    sink_name = _sink_index_to_name()
+    dflt = default_sink()
+    if not dflt or dflt.startswith("discord_user_"):
+        # The default itself is a per-user sink (the incident trigger) —
+        # evict to a real hardware sink instead.
+        dflt = ""
+        for line in r.stdout.splitlines():
+            p = line.split("\t")
+            if len(p) >= 2 and re.match(r"^(alsa|bluez)_output\.", p[1]):
+                dflt = p[1]
+                break
+    if not dflt:
+        return
+    try:
+        streams = list_sink_inputs()
+    except Exception:
+        return
+    for si in streams:
+        cur = sink_name.get(si.get("sink_index", ""), "")
+        nn = si.get("node_name", "")
+        if cur.startswith("discord_user_") and (
+                nn.startswith("discordpeer.") or nn.startswith("output.loopback")):
+            _move(si["id"], dflt)
+
+
 def _disable_cleanup():
     """One-shot teardown when balancing goes off AND no fx rules remain: evict
     anything still parked on a slot or fx sink back to the default sink and
@@ -397,6 +437,8 @@ def _disable_cleanup():
     pactl cost when we actually held state — the caller gates on that so
     idle-disabled ticks never reach here."""
     dflt = default_sink()
+    if dflt.startswith("discord_user_"):
+        dflt = ""   # never evict onto a per-user sink (feedback loop)
     sink_name = _sink_index_to_name()
     out_ids = _applvl_out_ids()
     try:
@@ -429,6 +471,9 @@ def _reconcile_locked():
     if not enabled and not fx_rules:
         if _assign or _slot_stream or _fx_streams:
             _disable_cleanup()
+        if _evt_wake["flag"]:
+            _evt_wake["flag"] = False
+            _break_feedback_loops()
         return
 
     try:
@@ -437,17 +482,34 @@ def _reconcile_locked():
         return  # transient pactl failure — keep current assignment
     sink_name = _sink_index_to_name()
     dflt = default_sink()
+    # NEVER evict/re-home anything onto a per-user sink masquerading as the
+    # default (the 2026-09-10 feedback incident) — better to leave streams
+    # where they are than to feed the loop.
+    if dflt.startswith("discord_user_"):
+        dflt = ""
 
     streams_by_id = {}          # sink-input id -> stream (real app streams only)
     for si in streams:
-        if _SKIP_STREAM_RE.match(si.get("node_name", "")):
+        cur_sink = sink_name.get(si.get("sink_index", ""), "")
+        nn = si.get("node_name", "")
+        # LOOP BREAKER (2026-09-10 incident): a per-user BRIDGE stream
+        # (discordpeer.*.out / a peruser loopback) sitting ON a discord_user_*
+        # sink is a closed feedback path — per-user monitor feeding a per-user
+        # sink screamed at full scale. Evict it to the real default sink
+        # IMMEDIATELY, before any other consideration.
+        if cur_sink.startswith("discord_user_") and (
+                nn.startswith("discordpeer.") or nn.startswith("output.loopback")):
+            if dflt and not dflt.startswith("discord_user_"):
+                _move(si["id"], dflt)
+            continue
+        if _SKIP_STREAM_RE.match(nn):
             continue
         # Streams the PerUserAudioSinks Vesktop plugin routed onto a per-user
         # null-sink (discord_user_<id>) are pinned there BY the app — moving
         # them would collapse the per-user split. The user's balanceable/
         # filterable stream is that sink's discordpeer.<id>.out bridge, which
         # sits on a real output and flows through here normally.
-        if sink_name.get(si.get("sink_index", ""), "").startswith("discord_user_"):
+        if cur_sink.startswith("discord_user_"):
             continue
         streams_by_id[si["id"]] = si
 
@@ -730,7 +792,8 @@ def cmd_daemon(_args):
         # that matter (app starts/stops/moves), plus server (default sink change).
         p = subprocess.Popen([PACTL, "subscribe"], stdout=subprocess.PIPE, text=True)
         for line in p.stdout:
-            if "sink-input" in line or "server" in line:
+            if "sink-input" in line or "server" in line or "sink" in line:
+                _evt_wake["flag"] = True
                 wake.set()
 
     threading.Thread(target=sub, daemon=True).start()
