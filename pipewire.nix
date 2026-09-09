@@ -237,9 +237,17 @@ pipewire-screenaudio:
     # on a free slot by MOVING its sink-inputs here (reversible, never creates
     # graph nodes — so it can't wedge the graph); the chain LUFS-levels that app
     # to a common target and brick-wall limits transients before handing off to
-    # the real default sink. Idle slots have no client and PipeWire suspends them
-    # (≈free). Everything stays 32-bit float end to end and the limiter caps the
-    # peak, so the one float->int conversion at the DAC can't clip — transparent.
+    # the real default sink. Everything stays 32-bit float end to end and the
+    # limiter caps the peak, so the one float->int conversion at the DAC can't
+    # clip — transparent.
+    #
+    # node.always-process (2026-09-09): slots used to suspend when idle, but a
+    # NEW stream then landed on a suspended chain that had to wake + activate
+    # its LSP plugins mid-stream-start — a loud CRACK of static every time
+    # someone started talking in a call. Keeping the chains always processing
+    # trades a little constant CPU (silence through leveler+limiter) for
+    # pop-free stream starts; it also keeps the downstream sink awake, which
+    # kills the DAC's own resume pop from silence.
     #
     # These are internal plumbing: the audio-devices LocalModule masks `applvl.*`
     # so they never appear as user-selectable outputs.
@@ -322,6 +330,9 @@ pipewire-screenaudio:
               "FL"
               "FR"
             ];
+            # never suspend: waking a suspended chain on stream arrival popped
+            # loudly (see the header comment).
+            "node.always-process" = true;
           };
           "playback.props" = {
             "node.name" = "applvl.${toString i}.out";
@@ -331,10 +342,8 @@ pipewire-screenaudio:
               "FR"
             ];
             # NOT passive: match the canonical "sink with filter" pattern so the
-            # slot reliably drives the real sink when an app is parked on it. An
-            # idle slot has no client feeding it, so PipeWire auto-suspends it
-            # anyway (≈free) — passive here risked the driver-starvation the
-            # static combine-sinks hit.
+            # slot reliably drives the real sink when an app is parked on it.
+            "node.always-process" = true;
           };
         };
       }) 4;
@@ -391,6 +400,8 @@ pipewire-screenaudio:
                 "FL"
                 "FR"
               ];
+              # never suspend — same wake-pop reasoning as the applvl pool.
+              "node.always-process" = true;
             };
             "playback.props" = {
               "node.name" = "strmfx.${preset}.out";
@@ -399,6 +410,7 @@ pipewire-screenaudio:
                 "FL"
                 "FR"
               ];
+              "node.always-process" = true;
             };
           };
         };
