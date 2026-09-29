@@ -40,6 +40,27 @@ in
       };
     };
 
+    # Bluetooth mic release: returns a BT headset to A2DP once its mic is idle,
+    # so it never gets stranded in low-quality HFP/HSP after use. Event-driven
+    # off pactl subscribe; an active call keeps the source RUNNING and is spared.
+    systemd.user.services.audio-bt-mic-release = {
+      description = "Release idle Bluetooth headset mics back to A2DP";
+      after = [
+        "graphical-session.target"
+        "pipewire.service"
+        "wireplumber.service"
+        "pipewire-pulse.service"
+      ];
+      partOf = [ "graphical-session.target" ];
+      wantedBy = [ "graphical-session.target" ];
+      unitConfig.StartLimitIntervalSec = 0;
+      serviceConfig = {
+        ExecStart = "${tools.bt-mic-release-sh}/bin/audio-bt-mic-release";
+        Restart = "always";
+        RestartSec = "3s";
+      };
+    };
+
     # Mic mix-sync daemon: keeps a fixed-delay `delayed.<mic>` wrapper per
     # physical mic and auto-measures the delays (speech cross-correlation) so
     # MIX mode mixes in-phase. combined_mics captures these wrappers — with

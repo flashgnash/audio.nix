@@ -43,6 +43,15 @@ pipewire-screenaudio:
     pulse.enable = true;
     wireplumber.enable = true;
 
+    # Never yank a Bluetooth headset into its low-quality HFP/HSP "headset" profile
+    # just because some app opened a recording stream: that silently drops A2DP
+    # music output to 16 kHz phone-call quality. The BT mic is therefore only ever
+    # available when the profile is switched to headset MANUALLY. audio-bt-mic-release
+    # (flakes/audio/tools-module.nix) returns the card to A2DP once the mic is idle.
+    wireplumber.extraConfig."51-bluez-no-headset-autoswitch" = {
+      "wireplumber.settings"."bluetooth.autoswitch-to-headset-profile" = false;
+    };
+
     # Make the RNNoise LADSPA plugin discoverable via PipeWire's LADSPA_PATH.
     # The filter-chain below references it by basename (`librnnoise_ladspa`),
     # which PipeWire resolves through this path — absolute paths are NOT honored.

@@ -2981,7 +2981,73 @@ let
     echo "$action"
   '';
 
+  # Return a Bluetooth headset to A2DP once its mic goes idle. WirePlumber's
+  # headset-profile autoswitch is disabled (see pipewire.nix), so a BT card only
+  # enters HFP/HSP when switched MANUALLY — but a card can still be left stranded
+  # there (low-quality output) after whatever used the mic goes away. This daemon
+  # watches pactl events and, whenever a bluez card is in a headset profile with
+  # its mic source fully suspended (no active capture), flips it back to A2DP. An
+  # in-progress call keeps the source RUNNING, so it's never cut off.
+  bt-mic-release-sh = pkgs.writeShellScriptBin "audio-bt-mic-release" ''
+    set -uo pipefail
+    pactl=${pkgs.pulseaudio}/bin/pactl
+    jq=${pkgs.jq}/bin/jq
+    head=${pkgs.coreutils}/bin/head
+    sleep=${pkgs.coreutils}/bin/sleep
+
+    release_idle() {
+      "$pactl" -f json list cards 2>/dev/null \
+        | "$jq" -r '.[] | select(.name | startswith("bluez_card."))
+                        | select(.active_profile | test("head|hfp|hsp"; "i"))
+                        | .name' \
+        | while read -r card; do
+            [ -n "$card" ] || continue
+            mac=''${card#bluez_card.}
+
+            # This card's mic source (bluez_input.<mac>) and its state. Source
+            # names use ':' in the MAC, card names use '_' — normalise both.
+            state=$("$pactl" -f json list sources 2>/dev/null \
+              | "$jq" -r --arg n "bluez_input.$mac" \
+                  '.[] | select((.name | gsub(":";"_")) == $n) | .state' \
+              | "$head" -n1)
+
+            # Only release once the mic has fully suspended — RUNNING/IDLE means
+            # something may still be capturing (e.g. a live call). Empty = the
+            # source is already gone, also safe to release.
+            case "$state" in
+              RUNNING|IDLE) continue ;;
+            esac
+
+            # Prefer a plain, available a2dp-sink profile for this card.
+            a2dp=$("$pactl" -f json list cards 2>/dev/null \
+              | "$jq" -r --arg c "$card" \
+                  '.[] | select(.name == $c) | .profiles | to_entries
+                   | map(select(.key | startswith("a2dp-sink")))
+                   | map(select(.value.available != "no"))
+                   | (map(select(.key == "a2dp-sink")) + .) | .[0].key // empty')
+            [ -n "$a2dp" ] || continue
+
+            "$pactl" set-card-profile "$card" "$a2dp" || true
+            echo "[bt-mic-release] $card -> $a2dp"
+          done
+    }
+
+    release_idle
+
+    # Event-driven: react to card/source/recording-client changes; a short settle
+    # delay lets PipeWire suspend the freed source before we re-check.
+    "$pactl" subscribe 2>/dev/null | while read -r ev; do
+      case "$ev" in
+        *"on card"*|*"on source"*|*"on source-output"*)
+          "$sleep" 0.6
+          release_idle
+          ;;
+      esac
+    done
+  '';
+
   tools = [
+    bt-mic-release-sh
     internal-node-sh
     balance-daemon-sh
     balance-read-sh
@@ -3056,6 +3122,7 @@ rec {
   # can apply the one canonical internal-node filter instead of keeping
   # their own copy of the mask.
   inherit
+    bt-mic-release-sh
     audio-xrun-guard-sh
     auto-mic-daemon-sh
     mix-sync-daemon-sh
