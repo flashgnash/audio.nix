@@ -135,6 +135,30 @@ in
       };
     };
 
+    # Echo-cancel auto-toggle: bypasses the AEC stage on headphones (where
+    # webrtc suppresses the near-end voice instead of echo) and re-enables it
+    # when the default output is a speaker-class sink. Event-driven off pactl
+    # subscribe.
+    systemd.user.services.audio-aec-auto = {
+      description = "Echo-cancel auto toggle (speakers on, headphones off)";
+      after = [
+        "graphical-session.target"
+        "pipewire.service"
+        "wireplumber.service"
+        "pipewire-pulse.service"
+      ];
+      partOf = [ "graphical-session.target" ];
+      wantedBy = [ "graphical-session.target" ];
+      # If pipewire-pulse isn't up yet `pactl subscribe` fails and the daemon
+      # exits; restart unconditionally rather than trip the start limit.
+      unitConfig.StartLimitIntervalSec = 0;
+      serviceConfig = {
+        ExecStart = "${tools.aec-auto-daemon-sh}/bin/audio-aec-auto-daemon";
+        Restart = "always";
+        RestartSec = "3s";
+      };
+    };
+
     # Auto-switch microphone daemon. Idle (spawns nothing) until the config
     # at ~/.config/auto-mic/config.json enables it with >=2 candidate mics.
     systemd.user.services.auto-mic = {

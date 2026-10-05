@@ -81,10 +81,19 @@ let
     #    buffer recorder — audio-mic-users keeps its proof-based check
     #    (a name-only mask would let anything hide behind the name).
     function internal_node(name) {
-      # rnnoise filter-chain: the virtual Noise Canceling Source and its
-      # passive capture stream — represented by the noise-cancel toggle.
+      # mic filter stack (echo-cancel then rnnoise): the virtual Noise
+      # Canceling Source and the capture streams of the stack —
+      # capture.rnnoise_source is the AEC intake (it holds the interface
+      # name), capture.rnnoise_source.filter the pinned rnnoise-chain capture;
+      # both prefix-matched. Represented by the noise-cancel toggle.
+      # NB: NO apostrophes in this awk library — it is embedded in
+      # single-quoted shell strings and one unbalances the quoting.
       if (name == "rnnoise_source") return 1
       if (name ~ /^capture\.rnnoise_source/) return 1
+      # echo-cancel stage internals: the cancelled output feeding the rnnoise
+      # chain, and the reference tap on the default sink monitor.
+      if (name == "aec_source") return 1
+      if (name == "aec_ref") return 1
       # mic-blend combiner (Combined Microphones) and its per-mic capture
       # streams (capture.combined_mics*, uniquified by PipeWire) — the
       # input MIX toggle is the representation.
@@ -525,9 +534,11 @@ let
   # the hardware mic. The previous (hardware) source is remembered so toggling
   # back restores exactly what was selected before.
 
-  # Point the filter's capture at a specific hardware mic. The filter capture
-  # (capture.rnnoise_source) is a passive stream that does NOT auto-follow the
-  # default once rnnoise_source itself is the default, so we retarget it
+  # Point the filter stack's intake at a specific hardware mic. The intake
+  # (capture.rnnoise_source — since the AEC stage landed this is the
+  # echo-cancel capture, which holds the interface name; see
+  # flakes/audio/pipewire.nix) is a passive stream that does NOT auto-follow
+  # the default once rnnoise_source itself is the default, so we retarget it
   # explicitly via the node's target.object metadata.
   rnnoise-set-input-sh = pkgs.writeShellScriptBin "audio-rnnoise-set-input" ''
     mic="$1"
@@ -552,6 +563,27 @@ let
         *) ${pkgs.pipewire}/bin/pw-link -d "$srcport" "capture.rnnoise_source:input_MONO" 2>/dev/null ;;
       esac
     done
+    # AEC bypassed? Then the inner chain capture is parked on the mic
+    # DIRECTLY (audio-aec-set off) and must follow the selection too, or it
+    # would keep reading the old mic. Same retarget + sweep discipline.
+    if [ "$(cat "$XDG_RUNTIME_DIR/qs-aec-on" 2>/dev/null)" = "off" ]; then
+      innerid=$(${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+        | ${pkgs.jq}/bin/jq -r '.[] | select(.info.props["node.name"] == "capture.rnnoise_source.filter") | .id' \
+        | head -1)
+      if [ -n "$innerid" ]; then
+        ${pkgs.pipewire}/bin/pw-metadata "$innerid" target.object "$mic" >/dev/null 2>&1
+        ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | ${pkgs.gawk}/bin/awk -v want="$mic" '
+          /^capture\.rnnoise_source\.filter:input_MONO/ { f = 1; next }
+          f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); print s }
+          f && /^[^[:space:]]/ { f = 0 }
+        ' | while IFS= read -r srcport; do
+          case "$srcport" in
+            "$mic":*) ;;
+            *) ${pkgs.pipewire}/bin/pw-link -d "$srcport" "capture.rnnoise_source.filter:input_MONO" 2>/dev/null ;;
+          esac
+        done
+      fi
+    fi
     echo done
   '';
 
@@ -589,6 +621,99 @@ let
     cur=$(cat "$XDG_RUNTIME_DIR/qs-rnnoise-on" 2>/dev/null)
     [ -z "$cur" ] && cur=on            # filter-chain boots ON
     echo "$cur"
+  '';
+
+  # ── Echo-cancel (AEC) bypass ────────────────────────────────────────────
+  # The echo-cancel stage (flakes/audio/pipewire.nix) is bypassed by
+  # retargeting the inner rnnoise-chain capture (capture.rnnoise_source.filter)
+  # between the cancelled output `aec_source` (AEC on) and whatever currently
+  # feeds the AEC intake (AEC off — the chain then reads the mic directly and
+  # the AEC nodes idle out of path). State in $XDG_RUNTIME_DIR/qs-aec-on; the
+  # graph boots ON. ALWAYS sweep stray links after the retarget: a metadata
+  # move can leave the old link behind, feeding the filter from BOTH paths at
+  # once — audibly doubled voice (bitten live 2026-10-03), the same failure
+  # mode the set-input sweep exists for on the intake node.
+  aec-set-sh = pkgs.writeShellScriptBin "audio-aec-set" ''
+    want="$1"   # "on" or "off"
+    case "$want" in on|off) ;; *) echo "usage: audio-aec-set on|off" >&2; exit 1 ;; esac
+    statefile="$XDG_RUNTIME_DIR/qs-aec-on"
+    innerid=$(${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+      | ${pkgs.jq}/bin/jq -r '.[] | select(.info.props["node.name"] == "capture.rnnoise_source.filter") | .id' \
+      | head -1)
+    [ -z "$innerid" ] && { echo "no capture.rnnoise_source.filter"; exit 1; }
+    if [ "$want" = "on" ]; then
+      tgt="aec_source"
+    else
+      # Bypass = read the same feed the AEC intake is on (selected mic or
+      # combined_mics). If that can't be resolved, FAIL rather than guess —
+      # leaving AEC on is always safe for routing.
+      tgt=$(${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input)
+      [ -z "$tgt" ] && { echo "cannot resolve current mic"; exit 1; }
+    fi
+    ${pkgs.pipewire}/bin/pw-metadata "$innerid" target.object "$tgt" >/dev/null 2>&1
+    ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | ${pkgs.gawk}/bin/awk -v want="$tgt" '
+      /^capture\.rnnoise_source\.filter:input_MONO/ { f = 1; next }
+      f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); print s }
+      f && /^[^[:space:]]/ { f = 0 }
+    ' | while IFS= read -r srcport; do
+      case "$srcport" in
+        "$tgt":*) ;;   # the intended feed stays
+        *) ${pkgs.pipewire}/bin/pw-link -d "$srcport" "capture.rnnoise_source.filter:input_MONO" 2>/dev/null ;;
+      esac
+    done
+    printf '%s\n' "$want" > "$statefile"
+    echo done
+  '';
+
+  aec-status-sh = pkgs.writeShellScriptBin "audio-aec-status" ''
+    cur=$(cat "$XDG_RUNTIME_DIR/qs-aec-on" 2>/dev/null)
+    [ -z "$cur" ] && cur=on            # the graph boots with AEC in path
+    echo "$cur"
+  '';
+
+  # Auto-drive the AEC from the DEFAULT OUTPUT class: speakers (room playback
+  # the mic can hear) → on; headphones/headsets (no acoustic echo path) → off.
+  # On headphones webrtc has no real echo to converge on, and its residual
+  # suppressor eats the near-end voice whenever the reference is active
+  # instead. Event-driven via pactl subscribe (no polling): re-evaluates on
+  # sink/server/card events (default switches, port changes, hotplug).
+  #
+  # Classification: only sinks we positively KNOW are headphones (name/port/
+  # description/form-factor mentioning headphone/headset, or bluez devices —
+  # which on this setup are always worn audio) bypass the AEC; EVERYTHING else (speakers,
+  # line-out, HDMI, dock digital outs, unknown) keeps it on. An IEC958 dock
+  # output feeding room speakers was misread as headphones under the old
+  # default-off rule, leaving room music uncancelled on the mic (2026-10-05).
+  aec-auto-daemon-sh = pkgs.writeShellScriptBin "audio-aec-auto-daemon" ''
+    classify() {
+      def=$(${pkgs.pulseaudio}/bin/pactl get-default-sink 2>/dev/null)
+      [ -z "$def" ] && return 1
+      {
+        printf '%s\n' "$def"
+        ${pkgs.pulseaudio}/bin/pactl list sinks 2>/dev/null | ${pkgs.gawk}/bin/awk -v def="$def" '
+          /^Sink #/   { inblk = 0 }
+          /^\tName:/  { inblk = ($2 == def) }
+          inblk && (/^\tDescription:/ || /^\tActive Port:/ || /device\.form_factor/) { print }
+        '
+      } | ${pkgs.gnugrep}/bin/grep -qiE 'headphone|headset|bluez' \
+        && echo headphones || echo speaker
+    }
+    evaluate() {
+      case "$(classify)" in
+        speaker) want=on ;;
+        headphones) want=off ;;
+        *) return 0 ;;   # no default sink yet — leave as-is
+      esac
+      cur=$(${aec-status-sh}/bin/audio-aec-status)
+      [ "$cur" = "$want" ] && return 0
+      ${aec-set-sh}/bin/audio-aec-set "$want"
+    }
+    evaluate
+    ${pkgs.pulseaudio}/bin/pactl subscribe | while IFS= read -r line; do
+      case "$line" in
+        *" on server"*|*" on sink"*|*" on card"*) evaluate ;;
+      esac
+    done
   '';
 
   # ── USB output headroom (device-side buffer) ────────────────────────────
@@ -1072,11 +1197,15 @@ let
         [ "$appname" = "qs-vad" ] && { sys_row "voice detect (shell)"; continue; }
         # The voice assistant's always-on wake-word recorder (cgroup-proven).
         is_assistant "$pid" && { sys_row "voice assistant (wake)"; continue; }
-        # The RNNoise filter's own passive capture: a server-side filter node
-        # has no Client (a real pulse/pipewire app always does, and can't fake
-        # "n/a"), so this can't be spoofed by naming a stream capture.rnnoise_source.
+        # The mic filter stack's own passive intake (the echo-cancel capture,
+        # which holds the capture.rnnoise_source interface name): a server-side
+        # filter node has no Client (a real pulse/pipewire app always does, and
+        # can't fake "n/a"), so this can't be spoofed by naming a stream
+        # capture.rnnoise_source. The inner rnnoise capture
+        # (capture.rnnoise_source.filter) captures aec_source, which is not in
+        # the mic-source allowlist, so the primary gate already drops it.
         [ "$nodename" = "capture.rnnoise_source" ] && [ "$client" = "n/a" ] \
-          && { sys_row "noise filter (rnnoise)"; continue; }
+          && { sys_row "mic filter (aec+rnnoise)"; continue; }
         # The mic combiner's per-mic capture streams (see combined_mics in
         # flakes/audio/pipewire.nix) — server-side too, same no-Client rule. Prefix
         # match because PipeWire may uniquify duplicate stream node names (the
@@ -3069,6 +3198,9 @@ let
     rnnoise-set-filter-sh
     rnnoise-toggle-sh
     rnnoise-status-sh
+    aec-set-sh
+    aec-status-sh
+    aec-auto-daemon-sh
     micblend-status-sh
     micblend-set-sh
     micblend-toggle-sh
@@ -3125,6 +3257,7 @@ rec {
     bt-mic-release-sh
     audio-xrun-guard-sh
     auto-mic-daemon-sh
+    aec-auto-daemon-sh
     mix-sync-daemon-sh
     cast-sync-daemon-sh
     balance-daemon-sh

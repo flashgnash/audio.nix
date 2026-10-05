@@ -60,11 +60,21 @@ pipewire-screenaudio:
       pkgs.lsp-plugins # autogain_stereo + limiter_stereo for the app-balance sinks
     ];
 
-    # RNNoise mic denoiser. Exposes ONE virtual source `rnnoise_source` that the
-    # whole audio stack lives behind, fed either by one selected mic or by the
-    # `combined_mics` blend of all physical mics (see combine-stream below). Denoising is bypassed IN-GRAPH (a dry/wet
+    # Mic filter stack: echo cancellation (WebRTC AEC) → RNNoise denoiser.
+    # Exposes ONE virtual source `rnnoise_source` that the whole audio stack
+    # lives behind, fed either by one selected mic or by the `combined_mics`
+    # blend of all physical mics (see combine-stream below), with the
+    # echo-cancel stage in between. Denoising is bypassed IN-GRAPH (a dry/wet
     # mixer), NOT by swapping the default device — so the filter can be toggled on
     # and off while `rnnoise_source` stays the single default source apps use.
+    # The AEC stage is bypassed AT RUNTIME by retargeting the inner chain
+    # capture between aec_source (on) and the selected mic (off) — see
+    # audio-aec-set in tools.nix. The audio-aec-auto daemon drives it from
+    # the default output: speakers/HDMI → on, headphones/headsets → off.
+    # On headphones there is no acoustic echo to cancel, but webrtc's
+    # residual-echo suppressor still fires whenever the reference is active
+    # and suppresses the near-end voice instead (observed 2026-10-03:
+    # "cancelling my own voice" during music + Discord).
     #
     # Graph: input fans (via `copy`) to two paths into a 2-input `mixer`:
     #   In 1 = dry (raw),  In 2 = wet (rnnoise output)
@@ -154,6 +164,77 @@ pipewire-screenaudio:
         # The quickshell MIX toggle instead loads pipewire-pulse's
         # module-combine-sink on demand and unloads it when MIX goes off —
         # see outdup-toggle-sh in hm-modules/quickshell/audio.nix.
+        # Acoustic echo cancellation (WebRTC AEC), ahead of RNNoise. It must
+        # sit BEFORE the denoiser: the canceller correlates the mic signal
+        # against what the speakers are playing, and RNNoise's gate/suppression
+        # is non-linear — echo mangled by it can no longer be matched to the
+        # reference, so AEC after RNNoise barely cancels anything.
+        #
+        # This stage's mic capture TAKES OVER the node name
+        # `capture.rnnoise_source`: that literal name (and its :input_MONO
+        # port) is the interface every selection tool keys on —
+        # audio-rnnoise-set-input's target.object + link sweep,
+        # audio-rnnoise-current-input, the auto-mic crossfade, the quickshell
+        # MIX toggle — so by holding it the AEC stage inherits ALL
+        # mic-selection plumbing unchanged. The RNNoise chain below is renamed
+        # to `capture.rnnoise_source.filter` and pinned statically at the
+        # cancelled output `aec_source` (both masked as internal plumbing by
+        # internal_node() in flakes/audio/tools.nix + the python twin in
+        # hm-modules/phone-mic/audio_devices.py).
+        #
+        # monitor.mode: no virtual sink is created — the echo reference is
+        # tapped from the DEFAULT SINK's monitor, so playback routing stays
+        # untouched (applvl/strmfx chains keep feeding the real sink, and the
+        # reference follows wherever the default output goes).
+        #
+        # capture boot target = combined_mics: a bare stream would follow the
+        # default source, which is rnnoise_source itself — a feedback loop
+        # WirePlumber can NOT prevent here (its loop guard only sees within a
+        # single node.link-group, and this loop would span two modules).
+        # combined_mics only ever ingests the delayed.<mic> wrappers, so it is
+        # loop-safe; the mic picker / auto-mic daemon retargets to the chosen
+        # mic via metadata moments after session start, exactly as before.
+        {
+          name = "libpipewire-module-echo-cancel";
+          # nofail: if the webrtc canceller is unavailable this must not take
+          # down PipeWire — the RNNoise chain below then fails SAFE (see its
+          # dont-reconnect comment) rather than looping.
+          flags = [ "nofail" ];
+          args = {
+            "monitor.mode" = true;
+            # Echo cancellation ONLY. webrtc's bundled extras stay off: the
+            # mic-path policy is "rnnoise + routing, no AGC/EQ", and webrtc's
+            # own noise suppression would double up on RNNoise downstream.
+            "aec.args" = {
+              "webrtc.gain_control" = false;
+              "webrtc.noise_suppression" = false;
+              "webrtc.high_pass_filter" = false;
+            };
+            "capture.props" = {
+              "node.name" = "capture.rnnoise_source";
+              "node.description" = "Echo Cancel Capture";
+              "node.passive" = true;
+              "audio.rate" = 48000;
+              "audio.position" = [ "MONO" ];
+              "target.object" = "combined_mics";
+            };
+            "source.props" = {
+              "node.name" = "aec_source";
+              "node.description" = "Echo Cancelled Mic";
+              "audio.rate" = 48000;
+              "audio.position" = [ "MONO" ];
+            };
+            # In monitor.mode the reference tap takes SINK.props (confirmed
+            # live: with these unset it appeared under the module default name
+            # `echo-cancel-sink`); playback.props is unused in this mode.
+            "sink.props" = {
+              "node.name" = "aec_ref";
+              "node.description" = "Echo Cancel Reference";
+              "node.passive" = true;
+              "audio.rate" = 48000;
+            };
+          };
+        }
         {
           name = "libpipewire-module-filter-chain";
           # nofail: a plugin load failure must never take down all of PipeWire.
@@ -226,9 +307,24 @@ pipewire-screenaudio:
               outputs = [ "mix:Out" ];
             };
             "capture.props" = {
-              "node.name" = "capture.rnnoise_source";
+              # Renamed from capture.rnnoise_source — the AEC capture above now
+              # holds that interface name. Still prefix-matched by the
+              # internal_node() mask, while the set-input link sweep's
+              # `^capture\.rnnoise_source:input` regex only matches the AEC
+              # node (the `:` anchors it).
+              "node.name" = "capture.rnnoise_source.filter";
               "node.passive" = true;
               "audio.rate" = 48000;
+              # Boots at the cancelled output; audio-aec-set retargets it
+              # between aec_source (AEC on) and the selected mic (AEC off).
+              # NO node.dont-reconnect here: it silently blocks metadata
+              # retargets (verified live 2026-10-03 — the move never happened,
+              # and a stray second link appeared instead: doubled voice
+              # mid-call). Loop safety doesn't need it anyway: this capture
+              # shares the filter-chain's node.link-group with rnnoise_source,
+              # so WirePlumber's loop guard refuses the self-link fallback if
+              # aec_source disappears.
+              "target.object" = "aec_source";
             };
             "playback.props" = {
               "node.name" = "rnnoise_source";
