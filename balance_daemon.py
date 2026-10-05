@@ -149,7 +149,7 @@ def _sink_index_to_name():
 
 def list_sink_inputs():
     """Parse `pactl list sink-inputs` into dicts:
-       {id, sink_index, binary, appname, node_name}.
+       {id, sink_index, binary, appname, node_name, corked}.
     A FAILED pactl RAISES so reconcile keeps the current assignment rather than
     reading a hiccup as 'no streams' and tearing everything down."""
     r = sh(PACTL, "list", "sink-inputs")
@@ -163,7 +163,7 @@ def list_sink_inputs():
             if cur:
                 items.append(cur)
             cur = {"id": m.group(1), "sink_index": "", "binary": "",
-                   "appname": "", "node_name": ""}
+                   "appname": "", "node_name": "", "corked": False}
             in_props = False
             continue
         if cur is None:
@@ -171,6 +171,11 @@ def list_sink_inputs():
         m = re.match(r"^\tSink:\s*(\d+)", head)
         if m:
             cur["sink_index"] = m.group(1)
+            in_props = False
+            continue
+        m = re.match(r"^\tCorked:\s*(\w+)", head)
+        if m:
+            cur["corked"] = (m.group(1) == "yes")
             in_props = False
             continue
         if head.startswith("\tProperties:"):
@@ -614,13 +619,29 @@ def _reconcile_locked():
             del _assign[slot]
     assigned_ids = set(_assign.values())
 
-    # Assign new streams to free slots.
+    # Assign new streams to free slots, LIVE streams first. A corked (paused/
+    # idle) stream is silent, so it must never hold a slot a playing stream
+    # needs: with the pool full of squatters, live audio ended up on the real
+    # sink UNLEVELED while paused streams kept their levelers (a long-idle
+    # soundboard mpv + a paused Firefox stream pinned two of the four slots,
+    # 2026-10-03 — music then flapped between leveled and raw as streams came
+    # and went). So when the pool is full, a live stream STEALS the slot of a
+    # corked one: moving the silent victim back to the default sink is
+    # pop-free, and it gets a slot again when it resumes (change event) or a
+    # slot frees up. Trims are per-app and restored on re-park, so nothing is
+    # lost in the shuffle.
     free = [s for s in SLOT_SINKS if s not in _assign]
-    for sid in bal_streams:
+    for sid in sorted(bal_streams, key=lambda s: (bal_streams[s].get("corked", False), int(s))):
         if sid in assigned_ids:
             continue
+        if not free and not bal_streams[sid].get("corked", False):
+            victim = next((sl for sl, vid in _assign.items()
+                           if bal_streams.get(vid, {}).get("corked", False)), None)
+            if victim is not None:
+                assigned_ids.discard(_assign.pop(victim))
+                free.append(victim)
         if not free:
-            break            # pool full — extra streams are evicted to the default sink below
+            break            # pool full of live streams — extras are evicted to the default sink below
         slot = free.pop(0)
         _assign[slot] = sid
         assigned_ids.add(sid)
