@@ -2979,7 +2979,9 @@ let
   balance-daemon-sh = pkgs.writeShellScriptBin "audio-balance-daemon" ''
     export PACTL=${pkgs.pulseaudio}/bin/pactl
     export PW_DUMP=${pkgs.pipewire}/bin/pw-dump
+    export PW_CLI=${pkgs.pipewire}/bin/pw-cli
     export PAREC=${pkgs.pulseaudio}/bin/parec
+    export MIC_INUSE=${mic-inuse-sh}/bin/audio-mic-inuse
     exec ${pkgs.python3}/bin/python ${balance-daemon-py} daemon
   '';
 
@@ -2999,14 +3001,19 @@ let
 
   # Live applied gains from the daemon's balance.json, as parseable lines:
   #   range|<lo dB>|<hi dB>   (auto-calibrated arc display range, if known)
-  #   out|<gain%>|<offset%>|<sink-input#>,...|<gain dB>|<slot>|<fx preset or ->
+  #   duck|<enabled 0|1>|<active 0|1>|<dip dB>|<mic-trigger 0|1>   (ducking state)
+  #   out|<gain%>|<offset%>|<sink-input#>,...|<gain dB>|<slot>|<fx preset or ->|<prio 0|1>|<dip dB>
   #   in|<gain%>|<mic node.name>
   balance-gains-sh = pkgs.writeShellScriptBin "audio-balance-gains" ''
     state="''${XDG_STATE_HOME:-$HOME/.local/state}/qs-audio/balance.json"
     [ -f "$state" ] || exit 0
     ${pkgs.jq}/bin/jq -r '
       (if .range then "range|\(.range.lo)|\(.range.hi)" else empty end),
-      (.output[]? | "out|\(.gain)|\(.offset // 100)|" + ((.ids // []) | map(tostring) | join(",")) + "|\(.gain_db // 0)|\(.slot // "")|\(.fx // "-")"),
+      (if .duck then "duck|" + (if .duck.enabled then "1" else "0" end)
+                + "|" + (if .duck.active then "1" else "0" end)
+                + "|\(.duck.db // 8)"
+                + "|" + (if .duck.mic then "1" else "0" end) else empty end),
+      (.output[]? | "out|\(.gain)|\(.offset // 100)|" + ((.ids // []) | map(tostring) | join(",")) + "|\(.gain_db // 0)|\(.slot // "")|\(.fx // "-")|\(.prio // 0)|\(.dip // 0)"),
       (.input[]?  | "in|\(.gain)|\(.key)")
     ' "$state" 2>/dev/null
     exit 0
@@ -3066,6 +3073,150 @@ let
       /^Sink Input #/ { cur=substr($3,2) }
       /node\.name = / { if (index($0, "\"" n "\"")) { print cur; exit } }')
     [ -n "$outid" ] && pactl set-sink-input-volume "$outid" "$pct%"
+    echo done
+  '';
+
+  # ── Voice-chat ducking ──────────────────────────────────────────────────────
+  # Dips everything that isn't voice chat while someone is speaking. Detection
+  # and the dipping itself live in the balance daemon (it is the single owner
+  # of stream placement/volumes — see balance_daemon.py); this is just the
+  # config CLI. Voice is detected on the voice app's own playback streams
+  # (vesktop by default; per-user discordpeer.* bridges are picked up
+  # automatically once the per-user split is active).
+  #   audio-duck read              → enabled|<0|1>  level|<dB>  active|<0|1>
+  #                                  prio|<app key> (one line per priority app)
+  #   audio-duck toggle|1|0        → enable/disable ducking
+  #   audio-duck set-level <dB>    → how many dB other audio dips (1-30), a
+  #                                  true dB dip (chain duck-gain stage)
+  #   audio-duck prio <id|key> [toggle|1|0]
+  #                                → mark/unmark an app as a PRIORITY stream:
+  #                                  priority streams trigger the ducking and
+  #                                  are never ducked themselves. Numeric arg =
+  #                                  sink-input id, resolved to its app key
+  #                                  (same awk resolver as audio-streamfx).
+  #   audio-duck mic [toggle|1|0]  → also trigger the duck from the USER'S OWN
+  #                                  speech (rnnoise_source detector in the
+  #                                  daemon), active only while a real app is
+  #                                  capturing the mic (per audio-mic-users).
+  #   audio-duck mic-level <dB>    → dip depth while the OWN-SPEECH trigger is
+  #                                  hot (floors the adaptive/far-end depth;
+  #                                  deeper by default — 15 dB).
+  duck-config-path = ''"''${XDG_CONFIG_HOME:-$HOME/.config}/audio-duck/config.json"'';
+
+  duck-sh = pkgs.writeShellScriptBin "audio-duck" ''
+    PATH=${pkgs.jq}/bin:${pkgs.coreutils}/bin:${pkgs.procps}/bin:${pkgs.pulseaudio}/bin:${pkgs.gawk}/bin:$PATH
+    cfg=${duck-config-path}
+    case "''${1:-read}" in
+      read)
+        if [ -f "$cfg" ]; then
+          jq -r '"enabled|" + (if .enabled then "1" else "0" end),
+                 "level|\(.duck_db // 8)",
+                 "adaptive|" + (if (.adaptive // true) then "1" else "0" end),
+                 "margin|\(.margin_db // 1)",
+                 "mic|" + (if (.mic_trigger // false) then "1" else "0" end),
+                 "miclevel|\(.mic_duck_db // 15)",
+                 ((.voice_apps // ["vesktop"])[] | "prio|" + ascii_downcase)' \
+            "$cfg" 2>/dev/null \
+            || { echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "prio|vesktop"; }
+        else
+          echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "prio|vesktop"
+        fi
+        state="''${XDG_STATE_HOME:-$HOME/.local/state}/qs-audio/balance.json"
+        { [ -f "$state" ] && jq -r \
+            '"active|" + (if .duck.active then "1" else "0" end)' \
+            "$state" 2>/dev/null; } || echo "active|0"
+        exit 0 ;;
+      prio)
+        target="''${2:-}"; action="''${3:-toggle}"
+        [ -z "$target" ] && { echo "usage: audio-duck prio <sink-input-id|app-key> [toggle|1|0]" >&2; exit 1; }
+        case "$target" in
+          *[!0-9,]*) key=$(echo "$target" | tr '[:upper:]' '[:lower:]') ;;
+          *)
+            # numeric: resolve sink-input id(s) -> app key, mirroring the
+            # daemon's app_key() (same resolver as audio-streamfx).
+            key=""
+            for id in $(echo "$target" | tr ',' ' '); do
+              k=$(pactl list sink-inputs | awk -v want="$id" '
+                /^Sink Input #/ { if (cur == want) exit; cur = substr($3, 2) }
+                cur != want { next }
+                /application\.process\.binary/ { split($0, a, "\""); bin  = a[2] }
+                /application\.name/            { split($0, a, "\""); app  = a[2] }
+                /node\.name = /                { split($0, a, "\""); node = a[2] }
+                END {
+                  if (tolower(node) ~ /^discordpeer\./) { print tolower(node); exit }
+                  b = tolower(bin)
+                  if (b == "" || b == "electron" || b == "chromium") {
+                    k = (app != "") ? app : ((node != "") ? node : "")
+                  } else k = b
+                  print tolower(k)
+                }')
+              [ -n "$k" ] && { key="$k"; break; }
+            done
+            [ -z "$key" ] && { echo "could not resolve an app key from sink-input(s) $target" >&2; exit 1; }
+            ;;
+        esac
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        jq --arg k "$key" --arg act "$action" '
+          .voice_apps = ((.voice_apps // ["vesktop"]) | map(ascii_downcase)) |
+          .voice_apps = (if ($act == "1") or
+                            ($act == "toggle" and ((.voice_apps | index($k)) == null))
+                         then (.voice_apps + [$k] | unique)
+                         else (.voice_apps - [$k]) end)
+        ' "$cfg" > "$tmp"
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      toggle|1|0)
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        case "$1" in
+          toggle) jq '.enabled = ((.enabled // false) | not)' "$cfg" > "$tmp" ;;
+          1) jq '.enabled = true'  "$cfg" > "$tmp" ;;
+          0) jq '.enabled = false' "$cfg" > "$tmp" ;;
+        esac
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      mic)
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        case "''${2:-toggle}" in
+          toggle) jq '.mic_trigger = ((.mic_trigger // false) | not)' "$cfg" > "$tmp" ;;
+          1) jq '.mic_trigger = true'  "$cfg" > "$tmp" ;;
+          0) jq '.mic_trigger = false' "$cfg" > "$tmp" ;;
+          *) rm -f "$tmp"; echo "usage: audio-duck mic [toggle|1|0]" >&2; exit 1 ;;
+        esac
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      set-level)
+        db="''${2:-}"
+        case "$db" in
+          ""|*[!0-9]*) echo "usage: audio-duck set-level <1-30 dB>" >&2; exit 1 ;;
+        esac
+        [ "$db" -lt 1 ] && db=1
+        [ "$db" -gt 30 ] && db=30
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        jq --argjson d "$db" '.duck_db = $d | del(.duck_pct)' "$cfg" > "$tmp"
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      mic-level)
+        db="''${2:-}"
+        case "$db" in
+          ""|*[!0-9]*) echo "usage: audio-duck mic-level <1-30 dB>" >&2; exit 1 ;;
+        esac
+        [ "$db" -lt 1 ] && db=1
+        [ "$db" -gt 30 ] && db=30
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        jq --argjson d "$db" '.mic_duck_db = $d' "$cfg" > "$tmp"
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      *)
+        echo "usage: audio-duck [read|toggle|1|0|set-level <dB>|mic [toggle|1|0]|mic-level <dB>|prio <id|key> [toggle|1|0]]" >&2
+        exit 1 ;;
+    esac
+    # Nudge the daemon to re-read config + reconcile now (event-driven).
+    pkill -HUP -f balance-daemon.py 2>/dev/null || true
     echo done
   '';
 
@@ -3237,6 +3388,7 @@ let
     balance-gains-sh
     balance-mutate-sh
     balance-setvol-sh
+    duck-sh
     streamfx-sh
     bt-audio-connect-sh
     recency-sh

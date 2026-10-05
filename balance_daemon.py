@@ -28,6 +28,25 @@ placement, or the two reconcilers race each other over the same streams.
 Fx-pinned streams are excluded from the balance pool and published as extra
 rows (with an "fx" field) so the gauges can show/drive them the same way.
 
+Voice-chat ducking (audio-duck) also lives here, for the same single-mover
+reason: ducking acts on the very chains/streams this reconcile
+owns. While speech is detected on a voice app's playback (vesktop for now;
+per-user discordpeer.* bridges are picked up automatically once present),
+every OTHER stream is dipped by duck_db decibels and restored after hold_ms
+of silence. For streams on a balance/fx chain the dip is its OWN GAIN LAYER:
+a dedicated duck mixer stage inside the static filter-chain (pipewire.nix),
+set via pw-cli set-param exactly like the rnnoise dry/wet bypass. The user's
+volumes — sink-input AND .out bridge trim — are never touched, so the gauge
+stays fully adjustable mid-duck and trims can't be corrupted. Only unmanaged
+streams (balance off / pool overflow), which have no chain to host a layer,
+fall back to dipping their own sink-input volume (saved and restored through
+pulse's CUBIC pct scale, 10^(-dB/60); a user change mid-duck wins over the
+restore). Transitions are RAMPED (~120 ms down so the dip lands with the
+voice, ~500 ms up so inter-sentence gaps don't pump the music; speech
+resuming mid-release turns the slide around from wherever it is). Config
+lives at ~/.config/audio-duck/config.json (audio-duck CLI, tools.nix);
+priority (duck-triggering) apps are its voice_apps list.
+
 The daemon is event-driven (pactl subscribe), never polls the graph. It publishes
 the applied per-slot gain for the bar to draw the "balance adjustment" arc:
   ~/.local/state/qs-audio/balance.json
@@ -50,7 +69,9 @@ import time
 
 PACTL = os.environ.get("PACTL", "pactl")
 PW_DUMP = os.environ.get("PW_DUMP", "pw-dump")
+PW_CLI = os.environ.get("PW_CLI", "pw-cli")
 PAREC = os.environ.get("PAREC", "parec")
+MIC_INUSE = os.environ.get("MIC_INUSE", "audio-mic-inuse")
 
 # OUTPUT arc display clamps. The applied gain is MEASURED per slot (post-filter
 # loudness minus pre-filter loudness — see the reader pair below); these only
@@ -95,6 +116,59 @@ FX_SINKS = set(FX_PRESETS.values())
 # Streams we must never try to balance: the balance/fx sinks' own outputs, and
 # the other virtual plumbing that shows up as sink-inputs.
 _SKIP_STREAM_RE = re.compile(r"^(applvl\.|strmfx\.|tailnet-|combined_)")
+
+# Voice-chat ducking config (audio-duck CLI). Disabled is the default.
+DUCK_CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "audio-duck", "config.json",
+)
+
+
+def load_duck_config():
+    """duck_db is how far other audio dips while voice is active. factor is
+    the pre-computed pulse-% multiplier: pactl percentages are CUBIC in
+    amplitude (amp = (pct/100)^3), so an X dB dip is pct * 10^(-X/60)."""
+    cfg = {"enabled": False, "duck_db": 8.0, "threshold_db": -40.0,
+           "hold_ms": 900, "voice_apps": ["vesktop"],
+           "adaptive": True, "margin_db": 1.0,
+           "mic_trigger": False, "mic_threshold_db": -40.0}
+    try:
+        with open(DUCK_CONFIG) as f:
+            c = json.load(f)
+        cfg["enabled"] = bool(c.get("enabled", False))
+        cfg["duck_db"] = max(1.0, min(30.0, float(c.get("duck_db", 8.0))))
+        cfg["threshold_db"] = float(c.get("threshold_db", -40.0))
+        cfg["hold_ms"] = max(100, int(c.get("hold_ms", 900)))
+        cfg["voice_apps"] = [str(a).lower()
+                             for a in c.get("voice_apps", ["vesktop"])] or ["vesktop"]
+        # Adaptive dip: size each chain's dip from LIVE loudness so ducked
+        # audio lands margin_db below the quietest priority source (~1 dB ≈
+        # 10% quieter). duck_db stays the fallback when measurements are
+        # missing. Attenuation only — never a boost.
+        cfg["adaptive"] = bool(c.get("adaptive", True))
+        cfg["margin_db"] = max(0.0, min(12.0, float(c.get("margin_db", 1.0))))
+        # Near-end trigger: duck when the USER speaks (detected on the
+        # rnnoise_source output), not just when far-end voice plays. Less
+        # music into the mic = less for the AEC's residual suppressor to
+        # mangle during double-talk (2026-10-05).
+        cfg["mic_trigger"] = bool(c.get("mic_trigger", False))
+        cfg["mic_threshold_db"] = float(c.get("mic_threshold_db", -40.0))
+        # Own-speech dips are DEEPER than far-end ones by default: the point
+        # is keeping room music out of the mic (and the AEC's residual
+        # suppressor), not polite listening balance — 8 dB was barely
+        # audible on the mic path (2026-10-05).
+        cfg["mic_duck_db"] = max(1.0, min(30.0, float(c.get("mic_duck_db", 15.0))))
+        # Shorter hold for the own-speech trigger: 900 ms (tuned for far-end
+        # speech) made the restore feel laggy after the user stops talking
+        # (2026-10-05). Own speech is detected locally with ~30 ms lag, so a
+        # tighter hold still bridges word gaps; the slow release glide
+        # covers sentence gaps.
+        cfg["mic_hold_ms"] = max(100, int(c.get("mic_hold_ms", 450)))
+    except Exception:
+        pass
+    cfg["factor"] = 10.0 ** (-cfg["duck_db"] / 60.0)      # pulse-% (cubic) domain
+    cfg["factor_lin"] = 10.0 ** (-cfg["duck_db"] / 20.0)  # linear, for chain gains
+    return cfg
 
 
 def sh(*args, timeout=10):
@@ -149,7 +223,7 @@ def _sink_index_to_name():
 
 def list_sink_inputs():
     """Parse `pactl list sink-inputs` into dicts:
-       {id, sink_index, binary, appname, node_name, corked}.
+       {id, sink_index, binary, appname, node_name, corked, volume}.
     A FAILED pactl RAISES so reconcile keeps the current assignment rather than
     reading a hiccup as 'no streams' and tearing everything down."""
     r = sh(PACTL, "list", "sink-inputs")
@@ -163,7 +237,8 @@ def list_sink_inputs():
             if cur:
                 items.append(cur)
             cur = {"id": m.group(1), "sink_index": "", "binary": "",
-                   "appname": "", "node_name": "", "corked": False}
+                   "appname": "", "node_name": "", "corked": False,
+                   "volume": None}
             in_props = False
             continue
         if cur is None:
@@ -176,6 +251,12 @@ def list_sink_inputs():
         m = re.match(r"^\tCorked:\s*(\w+)", head)
         if m:
             cur["corked"] = (m.group(1) == "yes")
+            in_props = False
+            continue
+        if head.startswith("\tVolume:"):
+            mm = re.search(r"(\d+)%", head)
+            if mm:
+                cur["volume"] = int(mm.group(1))
             in_props = False
             continue
         if head.startswith("\tProperties:"):
@@ -316,6 +397,530 @@ def _save_trims():
         pass
 
 
+# ------------------------------------------------------------------- ducking
+# Speech detector + duck state. One persistent parec --monitor-stream reader
+# per live voice stream (same no-churn reasoning as the slot gain readers —
+# open/close churn on captures causes xruns): a 50 ms RMS block above
+# threshold_db marks speech, `active` drops after hold_ms with no speech.
+# Engage/release call reconcile() directly — the subscribe loop's 0.2 s
+# coalesce would add audible lag to the dip.
+_duck_cfg = load_duck_config()        # refreshed at the top of every reconcile
+_duck = {"active": False, "deadline": 0.0, "timer": None,
+         # Separate freshness window for the OWN-SPEECH trigger: while hot,
+         # dips deepen to mic_duck_db (see _duck_eff_db) — far-end-triggered
+         # dips keep the polite duck_db/adaptive depth.
+         "mic_deadline": 0.0}
+_duck_lock = threading.Lock()
+_duck_readers = {}                    # voice sink-input id -> stop Event
+_duck_saved = {}                      # raw-ducked sink-input id -> pre-duck vol %
+_duck_raw_state = {"applied": False}  # duck state the last raw pass applied
+# Duck targets, rebuilt by every reconcile pass (under _recon_lock):
+#   chains: filter-chain sink node.names (applvl.N / strmfx.P) hosting
+#           non-priority streams — ducked via their in-graph duck-gain stage
+#   raw:    unmanaged sink-input id -> (base %, dipped %) — volume fallback
+_duck_fast = {"chains": set(), "voice_chains": set(), "raw": {}}
+_chain_ids = {}                       # chain node.name -> pipewire node id
+# Adaptive dip state: per-chain dip depth (dB), sized from live loudness by
+# _duck_adaptive_update (static duck_db when adaptive is off / unmeasured).
+DUCK_MAX_DB = 30.0
+_duck_chain_dip = {}                  # chain -> current dip depth (dB)
+_duck_chain_trim = {}                 # chain -> bridge trim % (heard-level calc)
+_duck_voice_level = {"db": None}      # last measured heard voice loudness
+
+
+def _trim_db(pct):
+    """A bridge sink-input volume % as dB (pulse cubic: amp = (pct/100)^3)."""
+    return 60.0 * math.log10(max(1, pct) / 100.0)
+
+
+def _duck_mic_hot():
+    """True while the own-speech trigger engaged/extended the current duck."""
+    return _duck["mic_deadline"] > time.monotonic()
+
+
+def _duck_eff_db():
+    """Effective dip depth: the deeper of the far-end level and (while the
+    user is the one speaking) the mic level."""
+    db = _duck_cfg["duck_db"]
+    if _duck_mic_hot():
+        db = max(db, _duck_cfg["mic_duck_db"])
+    return db
+
+
+def _duck_eff_factor():
+    """Pulse-% (cubic) multiplier for the effective dip depth."""
+    return 10.0 ** (-_duck_eff_db() / 60.0)
+
+
+def _dip(pct):
+    """An effective-depth dip of a pulse volume %, on pulse's cubic scale."""
+    return max(1, int(round(pct * _duck_eff_factor())))
+
+
+def _resolve_chain_ids(names):
+    """node.name -> pw node id for the duck-capable chain sinks, via one
+    pw-dump. Chains are static (declared in pipewire.nix) so ids are cached
+    for the daemon's lifetime; a failed set-param (PipeWire restarted => new
+    ids) evicts the entry so the next call re-resolves."""
+    missing = [n for n in names if n not in _chain_ids]
+    if not missing:
+        return
+    r = sh(PW_DUMP, timeout=10)
+    if r.returncode != 0:
+        return
+    try:
+        for obj in json.loads(r.stdout):
+            props = ((obj.get("info") or {}).get("props")) or {}
+            nn = props.get("node.name")
+            if nn in missing:
+                _chain_ids[nn] = obj["id"]
+    except Exception:
+        pass
+
+
+def _duck_chain_gain(name, f):
+    """Linear gain for a chain at ramp position f, from its own dip depth.
+    While the own-speech trigger is hot the mic depth FLOORS the adaptive
+    per-chain dip (never shrinks it). Clamped to <= 1.0 — ducking only
+    ever attenuates, never boosts."""
+    if f <= 0:
+        return 1.0
+    dip = max(0.0, _duck_chain_dip.get(name, _duck_cfg["duck_db"]))
+    if _duck_mic_hot():
+        dip = max(dip, _duck_cfg["mic_duck_db"])
+    return min(1.0, 10.0 ** (-(dip * f) / 20.0))
+
+
+def _duck_adaptive_update():
+    """Adaptive dip sizing (runs from output_gain_loop's 1 s tick): while
+    FULLY dipped, re-size each ducked chain's dip so its HEARD loudness
+    (post-chain measurement + bridge trim) sits margin_db below the QUIETEST
+    priority source's heard loudness. The pre-duck level is recovered by
+    de-embedding the dip we applied — feed-forward, not a feedback loop.
+    Dips clamp to [0, DUCK_MAX_DB]: audio already quieter than the voice is
+    LEFT ALONE (never raised), and slew-limiting (±4 dB/tick) keeps music
+    dynamics from pumping the dip. Mid-ramp the measurement EMAs lag the
+    gain we just set, so adaptation waits for the steady state."""
+    if not (_duck_any_trigger() and _duck_cfg["adaptive"]):
+        return
+    # Heard loudness of the quietest priority source; held through gaps.
+    vdbs = []
+    for c in _duck_fast.get("voice_chains", set()):
+        db = _slot_db_out.get(c)
+        if db is not None:
+            vdbs.append(db + _trim_db(_duck_chain_trim.get(c, 100)))
+    if vdbs:
+        _duck_voice_level["db"] = min(vdbs)
+    vdb = _duck_voice_level["db"]
+    if vdb is None:
+        return
+    if _duck_ramp["f"] != 1.0 or _duck_ramp["target"] != 1.0:
+        return
+    changed = False
+    for c in list(_duck_fast["chains"]):
+        out_db = _slot_db_out.get(c)
+        if out_db is None:
+            continue
+        cur = max(0.0, _duck_chain_dip.get(c, _duck_cfg["duck_db"]))
+        heard = out_db + _trim_db(_duck_chain_trim.get(c, 100))
+        pre = heard + cur              # de-embed our own dip (f == 1 here)
+        target = min(DUCK_MAX_DB,
+                     max(0.0, pre - (vdb - _duck_cfg["margin_db"])))
+        nxt = cur + max(-4.0, min(4.0, target - cur))
+        if abs(nxt - cur) > 0.25:
+            _duck_chain_dip[c] = nxt
+            changed = True
+    if changed:
+        _duck_apply_f(1.0)
+
+
+def _duck_set_chain_gain(name, gain):
+    """Drive the chain's duck mixer stage — the same in-graph Props mechanism
+    as the rnnoise dry/wet bypass. This is a SEPARATE multiply after the
+    leveler+limiter; no user-owned volume moves."""
+    sid = _chain_ids.get(name)
+    if sid is None:
+        _resolve_chain_ids({name})
+        sid = _chain_ids.get(name)
+        if sid is None:
+            return
+    r = sh(PW_CLI, "set-param", str(sid), "Props",
+           '{ params = [ "duck_l:Gain 1" %.4f "duck_r:Gain 1" %.4f ] }'
+           % (gain, gain))
+    # pw-cli exits 0 even when the id is gone ("no global N any more" goes
+    # to the output instead) — a PipeWire restart silently orphaned every
+    # cached id this way (2026-10-04). Treat error TEXT as failure too.
+    if r.returncode != 0 or "error" in (r.stdout + r.stderr).lower():
+        _chain_ids.pop(name, None)   # stale id — PipeWire restarted
+
+
+def _duck_sync_chains(new):
+    """Reconcile the duck-target chain set: chains that left (app went away,
+    stream became priority, slot freed) get their gain reset to unity; chains
+    that joined mid-duck are brought to the current ramp position so a stream
+    appearing mid-speech doesn't play loud until the next edge."""
+    removed = _duck_fast["chains"] - new
+    added = new - _duck_fast["chains"]
+    _duck_fast["chains"] = new
+    f = _duck_ramp["f"]
+    for name in removed:
+        _duck_chain_dip.pop(name, None)
+        _duck_set_chain_gain(name, 1.0)
+    if f > 0:
+        for name in added:
+            _duck_set_chain_gain(name, _duck_chain_gain(name, f))
+
+
+def _is_voice_stream(si):
+    """A stream whose audio TRIGGERS ducking (and must never be ducked):
+    the voice app's own playback, or a per-user discordpeer.* bridge."""
+    nn = (si.get("node_name") or "").lower()
+    if nn.startswith("discordpeer."):
+        return True
+    return app_key(si) in _duck_cfg["voice_apps"]
+
+
+# Ramped transitions. A hard volume step on every speech edge reads as
+# flicker — especially the restore in each inter-word gap. Instead a single
+# worker slides a duck fraction f (0 = restored, 1 = fully dipped) toward its
+# target: fast on attack so the dip still lands with the voice, slow on
+# release so gaps between sentences don't pump the music, and a resumed voice
+# mid-release just turns the slide around from wherever it is (no snap).
+# vol(f) = base * factor^f — linear-in-dB, which is what sounds even.
+# Attack is a FAST slide (~80 ms at fine 20 ms steps): the dip must land
+# within the first syllable — at the original 120 ms the duck audibly
+# STARTED after speech began (2026-10-05, own-speech trigger), while the
+# 50 ms/2-step version landed in time but read as a jarring cut (same day).
+# 80 ms in four steps is the tuned middle: still inside the syllable,
+# audibly a slide. Release stays the slow, coarse-stepped glide.
+DUCK_ATTACK_S = 0.08
+DUCK_ATTACK_TICK = 0.02
+DUCK_RELEASE_S = 0.5
+DUCK_RAMP_TICK = 0.08
+_duck_ramp = {"f": 0.0, "target": 0.0}
+_duck_ramp_cv = threading.Condition()
+
+
+def _duck_any_trigger():
+    """The two duck triggers are INDEPENDENT toggles: `enabled` = far-end
+    voice (the priority-app stream readers), `mic_trigger` = the user's own
+    speech. The duck machinery runs if either is on; there is no priority
+    concept on the mic side — own speech just ducks everything."""
+    return _duck_cfg["enabled"] or _duck_cfg["mic_trigger"]
+
+
+def _duck_engaged():
+    """True while ducking has ANY hold on the graph (fully dipped or
+    mid-ramp) — gates the raw-stream fallback and the published state."""
+    return _duck_any_trigger() and (
+        _duck["active"] or _duck_ramp["f"] > 0 or _duck_ramp["target"] > 0)
+
+
+def _duck_vol(pct):
+    """pct dipped by the CURRENT ramp position (f=1 ≡ _dip(pct))."""
+    f = _duck_ramp["f"]
+    if f <= 0:
+        return pct
+    return max(1, int(round(pct * (_duck_eff_factor() ** f))))
+
+
+def _duck_set_target(t):
+    with _duck_ramp_cv:
+        _duck_ramp["target"] = t
+        _duck_ramp_cv.notify()
+
+
+def _duck_apply_f(f):
+    """Apply ramp position f to the cached targets — no graph re-listing, so
+    a tick costs a few ms. Chains get their duck-gain stage set (linear dB
+    interpolation; the user's volumes never move); unmanaged raw streams
+    still dip their own sink-input volume (nothing else to set there).
+    Endpoint passes nudge a follow-up reconcile to mop up anything the cache
+    missed (streams that appeared mid-speech)."""
+    try:
+        with _recon_lock:
+            for name in list(_duck_fast["chains"]):
+                _duck_set_chain_gain(name, _duck_chain_gain(name, f))
+            fac = _duck_eff_factor() ** f
+            for sid, (base, _dipv) in _duck_fast["raw"].items():
+                if f > 0:
+                    _duck_saved.setdefault(sid, base)
+                    sh(PACTL, "set-sink-input-volume", sid,
+                       "%d%%" % max(1, int(round(base * fac))))
+                elif _duck_saved.pop(sid, None) is not None:
+                    sh(PACTL, "set-sink-input-volume", sid, "%d%%" % base)
+            _duck_raw_state["applied"] = f > 0
+    except Exception:
+        pass
+    if f in (0.0, 1.0):
+        _wake.set()
+
+
+def _duck_ramp_worker():
+    while True:
+        with _duck_ramp_cv:
+            if _duck_ramp["f"] == _duck_ramp["target"]:
+                _duck_ramp_cv.wait()
+                continue
+            tgt = _duck_ramp["target"]
+            f = _duck_ramp["f"]
+            if tgt > f:
+                tick = DUCK_ATTACK_TICK
+                f = min(tgt, f + tick / DUCK_ATTACK_S)
+            else:
+                tick = DUCK_RAMP_TICK
+                f = max(tgt, f - tick / DUCK_RELEASE_S)
+            _duck_ramp["f"] = f
+        _duck_apply_f(f)
+        if _duck_ramp["f"] != _duck_ramp["target"]:
+            with _duck_ramp_cv:
+                _duck_ramp_cv.wait(tick)
+
+
+def _duck_voice_heard(src="stream"):
+    engage = False
+    deepen = False
+    with _duck_lock:
+        if not _duck_any_trigger():
+            return
+        hold = (_duck_cfg["mic_hold_ms"] if src == "mic"
+                else _duck_cfg["hold_ms"]) / 1000.0
+        now = time.monotonic()
+        if src == "mic":
+            # cold→hot while already dipped: the ramp is parked (no ticks),
+            # so the deeper mic depth needs an explicit re-apply.
+            deepen = _duck["active"] and not _duck_mic_hot()
+            _duck["mic_deadline"] = now + hold
+        # max(): the shorter mic hold must never CLIP a longer far-end hold
+        # already in flight — deadlines only ever extend.
+        _duck["deadline"] = max(_duck["deadline"], now + hold)
+        if not _duck["active"]:
+            _duck["active"] = True
+            engage = True
+        if _duck["timer"] is None:
+            # Arm with THIS trigger's hold — arming with the far-end hold
+            # made a mic-only duck release at 900 ms regardless of the
+            # shorter mic deadline (the re-arming tick only fires then).
+            t = threading.Timer(hold, _duck_tick)
+            t.daemon = True
+            _duck["timer"] = t
+            t.start()
+    if engage:
+        _duck_set_target(1.0)
+    elif deepen:
+        _duck_apply_f(_duck_ramp["f"])
+
+
+def _duck_tick():
+    # Single re-arming release timer: readers only push the deadline forward
+    # (cheap), instead of spawning a Timer thread per 50 ms speech block.
+    with _duck_lock:
+        remain = _duck["deadline"] - time.monotonic()
+        if remain > 0.05 and _duck_any_trigger():
+            t = threading.Timer(remain, _duck_tick)
+            t.daemon = True
+            _duck["timer"] = t
+            t.start()
+            return
+        _duck["timer"] = None
+        _duck["active"] = False
+    _duck_set_target(0.0)
+
+
+def _duck_reader(sid, stop):
+    """RMS speech gate on one voice stream's own audio. --monitor-stream taps
+    the raw stream data (pre-volume), so user volume settings don't move the
+    detection point; it also works while the stream sits on a per-user
+    discord_user_* null sink."""
+    try:
+        p = subprocess.Popen(
+            [PAREC, "--monitor-stream=%s" % sid, "--format=float32le",
+             "--channels=1", "--rate=48000", "--raw",
+             # parec's default record latency buffers ~hundreds of ms before
+             # the first byte reaches us — that alone makes the dip trail the
+             # voice. 30 ms keeps the detector essentially realtime.
+             "--latency-msec=30"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return
+    block = int(48000 * 4 * 0.05)        # 50 ms blocks: fast attack
+    try:
+        while not stop.is_set():
+            buf = p.stdout.read(block)
+            if not buf:
+                break
+            a = array.array("f")
+            a.frombytes(buf[:len(buf) // 4 * 4])
+            if not len(a):
+                continue
+            s = 0.0
+            for v in a:
+                s += v * v
+            if math.sqrt(s / len(a)) > 10.0 ** (_duck_cfg["threshold_db"] / 20.0):
+                _duck_voice_heard()
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
+def _duck_mic_reader(stop):
+    """RMS speech gate on the USER'S OWN voice, read from rnnoise_source —
+    post-AEC + post-RNNoise, so played music is already cancelled/denoised
+    out of the signal before detection (raw mic audio would re-trigger on
+    the very music being ducked and pump). Shares _duck_voice_heard with
+    the stream readers: either trigger extends the same hold. The daemon's
+    cgroup (audio-balance.service) keeps this capture out of the mic-users
+    listing via its is_balance gate, same as the loudness readers."""
+    try:
+        p = subprocess.Popen(
+            [PAREC, "-d", "rnnoise_source", "--format=float32le",
+             "--channels=1", "--rate=48000", "--raw",
+             # Tighter than the stream readers' 30 ms: the dip must land
+             # within the user's first syllable, and this path ALSO pays
+             # the AEC+RNNoise chain latency before the voice reaches us.
+             "--latency-msec=10"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        p = None
+    try:
+        if p is not None:
+            # 20 ms RMS blocks (vs the stream readers' 50): worst-case
+            # detection lag ~30 ms after the onset clears the chain.
+            block = int(48000 * 4 * 0.02)
+            while not stop.is_set():
+                buf = p.stdout.read(block)
+                if not buf:
+                    break
+                a = array.array("f")
+                a.frombytes(buf[:len(buf) // 4 * 4])
+                if not len(a):
+                    continue
+                s = 0.0
+                for v in a:
+                    s += v * v
+                if math.sqrt(s / len(a)) > 10.0 ** (
+                        _duck_cfg["mic_threshold_db"] / 20.0):
+                    _duck_voice_heard("mic")
+    finally:
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        # Unlike the per-stream readers (whose sink-input vanishing removes
+        # them), rnnoise_source is static — if parec dies while the reader is
+        # still wanted (PipeWire restart), deregister so the next reconcile
+        # respawns it.
+        if _duck_readers.get(MIC_READER_KEY) is stop:
+            _duck_readers.pop(MIC_READER_KEY, None)
+
+
+MIC_READER_KEY = "mic"    # sentinel key in _duck_readers (real keys are ids)
+
+# Gate for the mic trigger: is a REAL app listening to the mic right now?
+# "A voice stream exists" is useless as a call signal on this desktop — the
+# voice assistant, clip tool and other plumbing keep streams alive constantly.
+# audio-mic-inuse (the red bar indicator's own gate) is the authoritative
+# answer: audio-mic-users' mic-source allowlist + cgroup gates exclude every
+# always-on system tap (wake-word recorder, replay buffer, mix-sync wrappers,
+# shell meters, this daemon's own readers) and the inuse wrapper drops the
+# pavucontrol-style meters on top. The result is cached and re-checked only
+# when source-output membership changes (dirty-flagged from the subscribe
+# thread) — not on every reconcile.
+_mic_users_state = {"dirty": True, "val": False}
+
+
+def _mic_in_use():
+    if _mic_users_state["dirty"]:
+        _mic_users_state["dirty"] = False
+        try:
+            r = sh(MIC_INUSE, timeout=10)
+            _mic_users_state["val"] = (
+                r.returncode == 0 and r.stdout.strip() == "yes")
+        except Exception:
+            _mic_users_state["val"] = False
+    return _mic_users_state["val"]
+
+
+def _duck_manage_readers(streams):
+    """One detector per live (uncorked) voice stream while `enabled`. Plus,
+    when mic_trigger is on (independently of `enabled`), ONE detector on the
+    user's own mic — but only while a REAL app is capturing the mic (in a
+    call / recording): otherwise nobody hears the mic, and talking over
+    music in the room shouldn't duck it. See _mic_in_use for why "a voice
+    stream exists" is not that signal."""
+    want = set()
+    if _duck_cfg["enabled"]:
+        want = {si["id"] for si in streams
+                if _is_voice_stream(si) and not si.get("corked", False)}
+    if _duck_cfg["mic_trigger"] and _mic_in_use():
+        if MIC_READER_KEY not in _duck_readers:
+            stop = threading.Event()
+            _duck_readers[MIC_READER_KEY] = stop
+            threading.Thread(target=_duck_mic_reader, args=(stop,),
+                             daemon=True).start()
+        want = want | {MIC_READER_KEY}
+    for sid in want - set(_duck_readers):
+        stop = threading.Event()
+        _duck_readers[sid] = stop
+        threading.Thread(target=_duck_reader, args=(sid, stop),
+                         daemon=True).start()
+    for sid in set(_duck_readers) - want:
+        _duck_readers.pop(sid).set()
+
+
+def _duck_raw(streams, sink_name, bridge_ids, active):
+    """Dip/restore the RAW sink-input volume of streams no bridge covers
+    (balancing off, or pool overflow). bridge_ids are dipped at their slot/fx
+    .out bridge instead. Pre-duck volumes are remembered in-memory and only
+    restored while still at the value we set — a volume the user changed
+    mid-duck wins over the restore (and is never raised above what we saved)."""
+    _duck_fast["raw"].clear()
+    live = set()
+    for si in streams:
+        sid = si["id"]
+        live.add(sid)
+        nn = si.get("node_name", "")
+        if _SKIP_STREAM_RE.match(nn) or nn.endswith(".out"):
+            continue
+        if sink_name.get(si.get("sink_index", ""), "").startswith("discord_user_"):
+            continue             # per-user originals: voice, and app-pinned
+        if _is_voice_stream(si):
+            continue
+        vol = si.get("volume")
+        saved = _duck_saved.get(sid)
+        if sid in bridge_ids or not active:
+            # restore (stream got a bridge mid-duck, or duck fully released).
+            # Anywhere inside the duck range counts (the ramp may have been
+            # interrupted); a volume the user pushed ABOVE the saved base is
+            # theirs and is left alone.
+            restored = None
+            if saved is not None:
+                _duck_saved.pop(sid, None)
+                if vol is not None and _dip(saved) - 1 <= vol <= saved + 1:
+                    sh(PACTL, "set-sink-input-volume", sid, "%d%%" % saved)
+                    restored = saved
+            if sid not in bridge_ids:
+                base = restored if restored is not None else vol
+                if base is not None:
+                    _duck_fast["raw"][sid] = (base, _dip(base))
+            continue
+        if saved is None and vol is not None:
+            # appeared mid-duck: dip to the CURRENT ramp position, not the
+            # endpoint, or it would jump ahead of everything else.
+            saved = vol
+            _duck_saved[sid] = vol
+            sh(PACTL, "set-sink-input-volume", sid, "%d%%" % _duck_vol(vol))
+        if saved is not None:
+            _duck_fast["raw"][sid] = (saved, _dip(saved))
+    # forget saved volumes for streams that vanished while ducked
+    for sid in list(_duck_saved):
+        if sid not in live:
+            _duck_saved.pop(sid)
+
+
 # ------------------------------------------------------------------- state file
 def _atomic_write(obj):
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -399,6 +1004,9 @@ def reconcile():
 # the standalone loop-breaker below runs only on these, so idle ticks stay
 # subprocess-free while any change that could form a loop triggers a check.
 _evt_wake = {"flag": False}
+# The daemon main-loop wake event (module-level so the duck fast path can
+# nudge a follow-up reconcile without running one inline).
+_wake = threading.Event()
 
 
 def _break_feedback_loops():
@@ -460,6 +1068,7 @@ def _disable_cleanup():
     _assign.clear()
     _slot_stream.clear()
     _fx_streams.clear()
+    _duck_sync_chains(set())
     _set_output_rows([])
 
 
@@ -471,14 +1080,32 @@ def _reconcile_locked():
     # state so subsequent disabled ticks return here immediately. Re-enabling
     # is unaffected: the config-change signal / subscribe thread re-triggers
     # reconcile and this guard falls through.
+    global _duck_cfg
+    _duck_cfg = load_duck_config()
     enabled = load_config()["output_enabled"]
     fx_rules = load_fx_rules()
     if not enabled and not fx_rules:
         if _assign or _slot_stream or _fx_streams:
             _disable_cleanup()
-        if _evt_wake["flag"]:
+        evt = _evt_wake["flag"]
+        if evt:
             _evt_wake["flag"] = False
             _break_feedback_loops()
+        # Ducking still works with balancing AND fx off — but only pay for a
+        # stream listing on real graph events or a duck transition, so idle
+        # ticks with ducking disabled stay subprocess-free as before.
+        if (_duck_any_trigger() or _duck_readers or _duck_saved) and (
+                evt or _duck_raw_state["applied"] != _duck_engaged()):
+            try:
+                streams = list_sink_inputs()
+            except Exception:
+                return
+            _duck_manage_readers(streams)
+            _duck_fast["voice_chains"] = set()
+            _duck_sync_chains(set())        # nothing parked on chains here
+            engaged = _duck_engaged()
+            _duck_raw(streams, _sink_index_to_name(), set(), engaged)
+            _duck_raw_state["applied"] = engaged
         return
 
     try:
@@ -524,6 +1151,14 @@ def _reconcile_locked():
     out_ids = _applvl_out_ids()
     trims_dirty = False
 
+    # Ducking: detectors follow the voice streams; capture the duck state once
+    # so this pass applies ONE consistent state everywhere (the release timer
+    # can flip it mid-pass).
+    _duck_manage_readers(streams)
+    duck_on = _duck_engaged()
+    duck_chains = set()       # chains hosting non-priority streams this pass
+    voice_chains = set()      # chains hosting priority streams (level refs)
+
     # ---- FX pinning (independent of balancing) -----------------------------
     # A rule pins EVERY stream of the app onto the preset's sink; several
     # streams (or even apps) sharing a preset simply mix before the filter.
@@ -556,6 +1191,12 @@ def _reconcile_locked():
         sids = fx_by_sink[fsink]
         key = app_key(streams_by_id[sids[0]])
         sig = ",".join(sids)
+        # Priority (voice) streams TRIGGER ducking and are never duck
+        # targets; every other chain ducks via its in-graph duck-gain stage,
+        # so the bridge volume below stays purely the user's trim.
+        hosts_voice = any(_is_voice_stream(streams_by_id[s]) for s in sids)
+        if not hosts_voice:
+            duck_chains.add(fsink)
         # New pinning on this sink? Apply the app's saved post-filter trim —
         # the SAME per-app store as the balance trims, so the user's gauge
         # setting carries over when fx toggles on/off or slots reshuffle.
@@ -573,11 +1214,19 @@ def _reconcile_locked():
                 else:
                     _trims[key] = offset
                 trims_dirty = True
+        if hosts_voice:
+            voice_chains.add(fsink)
+        _duck_chain_trim[fsink] = offset
         fx_rows.append({"key": key, "ids": [int(s) for s in sids],
                         "gain": gains.get(fsink, 100),
                         "gain_db": round(gains_db.get(fsink, 0.0), 1),
                         "offset": offset, "slot": fsink,
-                        "fx": fsink.split(".", 1)[1]})
+                        "fx": fsink.split(".", 1)[1],
+                        "prio": 1 if hosts_voice else 0,
+                        # this chain's CURRENT dip depth (adaptive), for the
+                        # gauge's hatched span — a global dB no longer fits
+                        "dip": 0 if hosts_voice else round(
+                            max(0.0, _duck_chain_dip.get(fsink, _duck_cfg["duck_db"])), 1)})
     # Freed fx sinks: reset the bridge trim so the next pinning starts clean.
     for fsink in list(_fx_streams):
         if fsink not in fx_by_sink:
@@ -600,6 +1249,10 @@ def _reconcile_locked():
             _slot_stream.clear()
         if trims_dirty:
             _save_trims()
+        _duck_fast["voice_chains"] = voice_chains
+        _duck_sync_chains(duck_chains)
+        _duck_raw(streams, sink_name, fx_ids, duck_on)
+        _duck_raw_state["applied"] = duck_on
         _set_output_rows(fx_rows)
         return
 
@@ -684,6 +1337,9 @@ def _reconcile_locked():
         if cur != slot:
             _move(si["id"], slot)
         key = app_key(si)
+        is_voice = _is_voice_stream(si)
+        if not is_voice:
+            duck_chains.add(slot)   # ducked via the chain's duck-gain stage
         # New stream on this slot? Apply the APP's saved post-leveler trim (so
         # trims survive restarts / reassignment) rather than inheriting the
         # previous stream's offset. Unknown apps start matched (100%).
@@ -703,16 +1359,27 @@ def _reconcile_locked():
                 else:
                     _trims[key] = offset
                 trims_dirty = True
+        if is_voice:
+            voice_chains.add(slot)
+        _duck_chain_trim[slot] = offset
         seen_trim_keys.add(key)
         rows.append({"key": key, "ids": [int(sid)], "gain": gains.get(slot, 100),
                      "gain_db": round(gains_db.get(slot, 0.0), 1),
-                     "offset": offset, "slot": slot})
+                     "offset": offset, "slot": slot,
+                     "prio": 1 if is_voice else 0,
+                     "dip": 0 if is_voice else round(
+                         max(0.0, _duck_chain_dip.get(slot, _duck_cfg["duck_db"])), 1)})
     if trims_dirty:
         _save_trims()
     # Forget stream-tracking for freed slots.
     for slot in list(_slot_stream.keys()):
         if slot not in _assign:
             _slot_stream.pop(slot, None)
+    _duck_fast["voice_chains"] = voice_chains
+    _duck_sync_chains(duck_chains)
+    # Streams no chain covers (pool overflow) still dip their own volume.
+    _duck_raw(streams, sink_name, set(_assign.values()) | fx_ids, duck_on)
+    _duck_raw_state["applied"] = duck_on
     _set_output_rows(rows + fx_rows)
 
 
@@ -774,6 +1441,10 @@ def output_gain_loop():
             reconcile()
         elif rng_moved:
             _publish()
+        try:
+            _duck_adaptive_update()
+        except Exception:  # noqa: BLE001 — never kill the gain thread
+            pass
         time.sleep(1.0)
 
 
@@ -797,7 +1468,11 @@ def _publish():
             lo, hi = lo - pad, hi + pad
         rng = {"lo": round(lo, 1), "hi": round(hi, 1)}
     with _publish_lock:
-        obj = {"output": _output_rows, "input": _input_rows, "range": rng}
+        obj = {"output": _output_rows, "input": _input_rows, "range": rng,
+               "duck": {"enabled": _duck_cfg["enabled"],
+                        "active": _duck["active"],
+                        "db": _duck_cfg["duck_db"],
+                        "mic": _duck_cfg["mic_trigger"]}}
         if obj != _last_published:
             _last_published = obj
             _atomic_write(obj)
@@ -806,16 +1481,37 @@ def _publish():
 # ------------------------------------------------------------------- daemon
 def cmd_daemon(_args):
     _load_trims()
-    wake = threading.Event()
+    wake = _wake
 
     def sub():
         # `pactl subscribe` streams change events; sink-input events are the ones
         # that matter (app starts/stops/moves), plus server (default sink change).
-        p = subprocess.Popen([PACTL, "subscribe"], stdout=subprocess.PIPE, text=True)
-        for line in p.stdout:
-            if "sink-input" in line or "server" in line or "sink" in line:
-                _evt_wake["flag"] = True
-                wake.set()
+        # The subscription DIES when pipewire-pulse restarts — respawn it, and
+        # treat each respawn as a probable PipeWire restart: every cached chain
+        # node id is suspect, so drop them for re-resolution (2026-10-04: stale
+        # ids silently ate all duck set-params after a pipewire restart).
+        while True:
+            p = subprocess.Popen([PACTL, "subscribe"],
+                                 stdout=subprocess.PIPE, text=True)
+            for line in p.stdout:
+                # Capture (source-output) MEMBERSHIP changes re-gate the mic
+                # duck trigger — 'new'/'remove' only, so per-capture 'change'
+                # chatter (volume moves on persistent taps) stays wake-free.
+                if "source-output" in line:
+                    if "'new'" in line or "'remove'" in line:
+                        _mic_users_state["dirty"] = True
+                        # evt too: the balancing-off early path only manages
+                        # duck readers on real graph events.
+                        _evt_wake["flag"] = True
+                        wake.set()
+                elif "sink-input" in line or "server" in line or "sink" in line:
+                    _evt_wake["flag"] = True
+                    wake.set()
+            _chain_ids.clear()
+            _evt_wake["flag"] = True
+            _mic_users_state["dirty"] = True
+            wake.set()
+            time.sleep(2.0)
 
     threading.Thread(target=sub, daemon=True).start()
 
@@ -826,6 +1522,8 @@ def cmd_daemon(_args):
 
     # OUTPUT gain arc: reconstruct applied gain from pre-filter monitor loudness.
     threading.Thread(target=output_gain_loop, daemon=True).start()
+    # Duck ramp worker: slides volumes between base and dipped on duck edges.
+    threading.Thread(target=_duck_ramp_worker, daemon=True).start()
 
     reconcile()   # first paint
     # Periodic light refresh keeps the published gain arc live while assigned

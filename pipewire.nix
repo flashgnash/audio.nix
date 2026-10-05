@@ -406,6 +406,24 @@ pipewire-screenaudio:
                   "Release time (ms)" = 8.0;
                 };
               }
+              # Voice-chat duck gain (audio-duck): its own layer AFTER the
+              # leveler+limiter, driven live by the balance daemon via
+              # `pw-cli set-param <sink> Props '{params=["duck_l:Gain 1" …]}'`
+              # (same in-graph mechanism as the rnnoise dry/wet bypass). The
+              # user's bridge volume is NEVER touched by ducking — their mix
+              # stays theirs, this is a separate multiply. Unity at boot.
+              {
+                type = "builtin";
+                label = "mixer";
+                name = "duck_l";
+                control."Gain 1" = 1.0;
+              }
+              {
+                type = "builtin";
+                label = "mixer";
+                name = "duck_r";
+                control."Gain 1" = 1.0;
+              }
             ];
             links = [
               {
@@ -416,14 +434,22 @@ pipewire-screenaudio:
                 output = "lvl:Output R";
                 input = "lim:Input R";
               }
+              {
+                output = "lim:Output L";
+                input = "duck_l:In 1";
+              }
+              {
+                output = "lim:Output R";
+                input = "duck_r:In 1";
+              }
             ];
             inputs = [
               "lvl:Input L"
               "lvl:Input R"
             ];
             outputs = [
-              "lim:Output L"
-              "lim:Output R"
+              "duck_l:Out"
+              "duck_r:Out"
             ];
           };
           "capture.props" = {
@@ -488,6 +514,41 @@ pipewire-screenaudio:
           inherit label control;
           name = "${name}_${side}";
         };
+        # Append the voice-chat duck gain stage (audio-duck) to a preset graph:
+        # two builtin mixers after the preset's final node, unity at boot, set
+        # live by the balance daemon via pw-cli set-param — a separate multiply
+        # so ducking never touches the user's bridge volume (their mix). Same
+        # stage exists in every applvl chain above.
+        withDuck = graph: graph // {
+          nodes = graph.nodes ++ [
+            {
+              type = "builtin";
+              label = "mixer";
+              name = "duck_l";
+              control."Gain 1" = 1.0;
+            }
+            {
+              type = "builtin";
+              label = "mixer";
+              name = "duck_r";
+              control."Gain 1" = 1.0;
+            }
+          ];
+          links = graph.links ++ [
+            {
+              output = builtins.elemAt graph.outputs 0;
+              input = "duck_l:In 1";
+            }
+            {
+              output = builtins.elemAt graph.outputs 1;
+              input = "duck_r:In 1";
+            }
+          ];
+          outputs = [
+            "duck_l:Out"
+            "duck_r:Out"
+          ];
+        };
         mkFx = preset: desc: graph: {
           name = "libpipewire-module-filter-chain";
           # nofail: a plugin load failure must never take down PipeWire.
@@ -495,7 +556,7 @@ pipewire-screenaudio:
           args = {
             "node.description" = desc;
             "media.name" = desc;
-            "filter.graph" = graph;
+            "filter.graph" = withDuck graph;
             "capture.props" = {
               "node.name" = "strmfx.${preset}";
               "node.description" = desc;
