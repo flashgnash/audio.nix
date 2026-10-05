@@ -1019,6 +1019,12 @@ let
   # the exe (kernel truth) is what the UI reveals on hover. Defeated only by
   # root/kernel-level access, which is out of scope.
   mic-users-sh = pkgs.writeShellScriptBin "audio-mic-users" ''
+    # Pinned PATH: this script historically relied on the caller's PATH for
+    # pactl/awk/find/…, which broke the first non-interactive consumer (the
+    # balance daemon's mic duck gate runs under systemd's minimal PATH —
+    # every tool errored and the gate fail-opened to "no mic users",
+    # 2026-10-05).
+    PATH=${pkgs.pulseaudio}/bin:${pkgs.gawk}/bin:${pkgs.coreutils}/bin:${pkgs.findutils}/bin:${pkgs.gnused}/bin:${pkgs.gnugrep}/bin:$PATH
     # --all: also emit the always-on/system captures (as `sys` rows) instead of
     # dropping them. Default output must stay byte-identical to the flagless
     # historical listing, so the flag only ever ADDS rows.
@@ -1156,6 +1162,36 @@ let
       return 1
     }
 
+    # "yes" if $1 is one of the mix-sync daemon's pw-loopback time-align
+    # wrappers (sync.<mic> → delayed.<mic>). They capture the raw mics
+    # CONTINUOUSLY by design — plumbing, never an app using the mic. Proven
+    # by exe + the systemd cgroup, same trust model as the gates above.
+    is_micsync() {
+      p="$1"
+      [ -n "$p" ] || return 1
+      case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
+        *pw-loopback*) ;;
+        *) return 1 ;;
+      esac
+      case "$(cat "/proc/$p/cgroup" 2>/dev/null)" in
+        *audio-mix-sync.service*) return 0 ;;
+      esac
+      return 1
+    }
+
+    # Client index → process id, for capture streams that carry no
+    # application.process.id of their own (pw-loopback streams: the pid
+    # lives on the CLIENT object, not the stream). Only used as a fallback
+    # when the stream props have no pid at all.
+    client_pids=$(pactl list clients 2>/dev/null | awk '
+      /^Client #/                   { idx = substr($2, 2) }
+      /application\.process\.id = / { split($0, a, "\""); print idx, a[2] }
+    ')
+    client_pid() {
+      [ -n "$1" ] && [ "$1" != "n/a" ] || return 0
+      printf '%s\n' "$client_pids" | awk -v c="$1" '$1 == c { print $2; exit }'
+    }
+
     {
       # ── PipeWire capture streams ───────────────────────────────────────────
       pactl list source-outputs 2>/dev/null | awk -v SEP="$SEP" '
@@ -1212,6 +1248,24 @@ let
         # per-mic sys rows are identical and collapse under the final sort -u).
         case "$nodename" in capture.combined_mics*)
           [ "$client" = "n/a" ] && { sys_row "mic blend (combiner)"; continue; } ;;
+        esac
+        # The mix-sync daemon's delayed.<mic> wrappers (audio-mix-sync): each
+        # is a pw-loopback whose capture side is named input.sync.<mic>. One
+        # per physical mic, hence the pile of phantoms when unlisted. NB these
+        # are NOT server-side: pw-loopback is a real client, so the no-Client
+        # rule the blend/filter rows use never matched (found 2026-10-05 —
+        # the first cut of this gate required client = n/a and let every sync
+        # tap through). Instead the stream's Client resolves to a pid (the
+        # pid lives on the client object, not the stream) and the exe+cgroup
+        # proof pins it to the actual mix-sync service.
+        case "$nodename" in input.sync.*)
+          [ "$client" = "n/a" ] && { sys_row "mic mix sync (delay wrapper)"; continue; }
+          syncpid=$(client_pid "$client")
+          if is_micsync "$syncpid"; then
+            pid="$syncpid"
+            sys_row "mic mix sync (delay wrapper)"
+            continue
+          fi ;;
         esac
         # (tailnet-audio donated mics are plain pipe-source nodes with no internal
         # capture stream, so they need no exclusion here — they behave exactly
