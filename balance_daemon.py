@@ -72,6 +72,8 @@ PW_DUMP = os.environ.get("PW_DUMP", "pw-dump")
 PW_CLI = os.environ.get("PW_CLI", "pw-cli")
 PAREC = os.environ.get("PAREC", "parec")
 MIC_INUSE = os.environ.get("MIC_INUSE", "audio-mic-inuse")
+DBUS_MONITOR = os.environ.get("DBUS_MONITOR", "dbus-monitor")
+BUSCTL = os.environ.get("BUSCTL", "busctl")
 
 # OUTPUT arc display clamps. The applied gain is MEASURED per slot (post-filter
 # loudness minus pre-filter loudness — see the reader pair below); these only
@@ -114,8 +116,11 @@ FX_PRESETS = {"voice": "strmfx.voice", "bass": "strmfx.bass"}
 FX_SINKS = set(FX_PRESETS.values())
 
 # Streams we must never try to balance: the balance/fx sinks' own outputs, and
-# the other virtual plumbing that shows up as sink-inputs.
-_SKIP_STREAM_RE = re.compile(r"^(applvl\.|strmfx\.|tailnet-|combined_)")
+# the other virtual plumbing that shows up as sink-inputs. `soundboard` is the
+# soundboard's mpv daemon — its output ports are manually pw-link'ed into mic
+# capture streams (scripts/soundboard.nix); pooling it onto an applvl slot
+# re-routes it to the speakers and sweeps those injection links (2026-10-05).
+_SKIP_STREAM_RE = re.compile(r"^(applvl\.|strmfx\.|tailnet-|combined_|soundboard)")
 
 # Voice-chat ducking config (audio-duck CLI). Disabled is the default.
 DUCK_CONFIG = os.path.join(
@@ -131,7 +136,7 @@ def load_duck_config():
     cfg = {"enabled": False, "duck_db": 8.0, "threshold_db": -40.0,
            "hold_ms": 900, "voice_apps": ["vesktop"],
            "adaptive": True, "margin_db": 1.0,
-           "mic_trigger": False, "mic_threshold_db": -40.0}
+           "mic_trigger": False, "mic_threshold_db": -35.0}
     try:
         with open(DUCK_CONFIG) as f:
             c = json.load(f)
@@ -152,7 +157,10 @@ def load_duck_config():
         # music into the mic = less for the AEC's residual suppressor to
         # mangle during double-talk (2026-10-05).
         cfg["mic_trigger"] = bool(c.get("mic_trigger", False))
-        cfg["mic_threshold_db"] = float(c.get("mic_threshold_db", -40.0))
+        # -35 default: impulsive transients that survive RNNoise (chair
+        # creaks, desk knocks) sit lower than on-mic speech; -40 tripped
+        # on them (2026-10-08).
+        cfg["mic_threshold_db"] = float(c.get("mic_threshold_db", -35.0))
         # Own-speech dips are DEEPER than far-end ones by default: the point
         # is keeping room music out of the mic (and the AEC's residual
         # suppressor), not polite listening balance — 8 dB was barely
@@ -789,6 +797,13 @@ def _duck_mic_reader(stop):
             # 20 ms RMS blocks (vs the stream readers' 50): worst-case
             # detection lag ~30 ms after the onset clears the chain.
             block = int(48000 * 4 * 0.02)
+            # Onset debounce: a NEW dip needs 3 consecutive hot blocks
+            # (60 ms sustained). Impulsive transients that survive RNNoise
+            # (chair creaks, knocks) are over in a block or two; speech
+            # onsets sustain well past 60 ms. While the mic trigger is
+            # already hot, a single block extends the hold — no added lag
+            # mid-speech.
+            hot = 0
             while not stop.is_set():
                 buf = p.stdout.read(block)
                 if not buf:
@@ -802,7 +817,11 @@ def _duck_mic_reader(stop):
                     s += v * v
                 if math.sqrt(s / len(a)) > 10.0 ** (
                         _duck_cfg["mic_threshold_db"] / 20.0):
-                    _duck_voice_heard("mic")
+                    hot += 1
+                    if hot >= 3 or _duck_mic_hot():
+                        _duck_voice_heard("mic")
+                else:
+                    hot = 0
     finally:
         if p is not None:
             try:
@@ -993,6 +1012,186 @@ def _set_out_vol(slot, pct, out_ids=None):
     sid = ids.get(slot)
     if sid is not None:
         sh(PACTL, "set-sink-input-volume", str(sid), "%d%%" % pct)
+
+
+# --------------------------------------------------------- AVRCP remote volume
+# A bluetooth A2DP SOURCE (a phone playing into this machine) reports its
+# volume buttons over AVRCP: bluez emits PropertiesChanged on the device's
+# MediaTransport1 Volume (0-127). The phone ALSO scales its outgoing PCM, but
+# the leveler normalises that away — so the buttons are routed to the stream's
+# post-leveler trim (the same applvl.<n>.out volume the UI gauge drives, which
+# reconcile persists per app key). Off-slot streams get their sink-input volume
+# set directly instead (no leveler to fight there).
+#
+# The sync is TWO-WAY: Volume is writable, so when the trim changes PC-side
+# (gauge drag, restored trim on reconnect) reconcile pushes it back to the
+# transport and the phone's own volume display tracks the PC. The echo of our
+# own write (bluez re-emits it) is dropped by value in the watcher.
+_avrcp_state = {}        # mac -> {"vol": 0-127 last seen, "path": transport path}
+_avrcp_lock = threading.Lock()
+
+
+def _avrcp_pct(vol):
+    """AVRCP 0-127 -> pactl percent, linear: the phone's displayed volume and
+    the PC gauge agree (0=0, 100=100). pactl's percent scale is itself
+    perceptually spaced (cubed amplitude), matching how volume steps are meant
+    to feel — no curve correction on top."""
+    return max(0, min(100, int(round(vol * 100.0 / 127.0))))
+
+
+def _avrcp_raw(pct):
+    """Inverse of _avrcp_pct."""
+    return max(0, min(127, int(round(pct * 127.0 / 100.0))))
+
+
+def _avrcp_mac_of(node_name):
+    """bluez_input.<MAC>.<sep> -> the underscored MAC part, or ''."""
+    m = re.match(r"bluez_input\.([0-9A-Fa-f_]+)\.\d+$", node_name or "")
+    return m.group(1) if m else ""
+
+
+def _avrcp_known_pct(mac):
+    """Phone's current volume as a trim pct, or None if no transport seen."""
+    with _avrcp_lock:
+        st = _avrcp_state.get(mac)
+        return _avrcp_pct(st["vol"]) if st and st["vol"] is not None else None
+
+
+def _avrcp_sync_to_phone(mac, pct):
+    """Push the PC-side trim to the phone's volume display. Writes only when
+    the phone meaningfully disagrees (±1 raw step absorbs the pct<->127
+    rounding). A short grace window after any phone-originated change wins
+    conflicts for the phone: a reconcile pass that read the trim BEFORE a
+    button press landed must not shove the stale value back."""
+    with _avrcp_lock:
+        st = _avrcp_state.get(mac)
+        if not st or not st.get("path") or st["vol"] is None:
+            return
+        if time.time() - st["phone_ts"] < 2.0:
+            return
+        desired = _avrcp_raw(pct)
+        if abs(desired - st["vol"]) <= 1:
+            return
+        st["vol"] = desired     # pre-mark so the echo is recognised
+        path = st["path"]
+    sh(BUSCTL, "set-property", "org.bluez", path,
+       "org.bluez.MediaTransport1", "Volume", "q", str(desired))
+
+
+def _avrcp_boost_pct(vol):
+    """The phone scales its own PCM by ~vol/127 before transmitting (iOS does
+    this even with absolute volume active). Cancel it exactly: a sink-input
+    volume whose CUBIC amplitude is 127/vol makes the audio entering the slot
+    full-scale-equivalent, so the trim is the ONLY effective volume and the
+    gauge's percent means the same loudness as any other app's. Capped at
+    200% (+18 dB) — below ~12% phone volume the bottom end just stays quiet
+    rather than boosting noise into audibility."""
+    if vol <= 0:
+        return 100
+    return min(200, int(round(100.0 * (127.0 / vol) ** (1.0 / 3.0))))
+
+
+def _avrcp_apply(mac, vol):
+    pct = _avrcp_pct(vol)
+    prefix = "bluez_input." + mac
+    try:
+        streams = list_sink_inputs()
+    except Exception:
+        return
+    sink_name = _sink_index_to_name()
+    for si in streams:
+        if not si.get("node_name", "").startswith(prefix):
+            continue
+        cur = sink_name.get(si.get("sink_index", ""), "")
+        if cur in SLOT_SINKS or cur in FX_SINKS:
+            # Undo the phone-side scaling on the stream, carry the volume on
+            # the trim (post-leveler, same place every app's gauge acts).
+            sh(PACTL, "set-sink-input-volume", str(si["id"]),
+               "%d%%" % _avrcp_boost_pct(vol))
+            _set_out_vol(cur, pct)
+            _wake.set()      # reconcile re-reads + persists the trim
+        else:
+            # Off-slot there is no trim stage: fold both into the stream
+            # volume (inverse boost × desired cubic pct = pct·(127/vol)^⅓).
+            eff = 0 if vol <= 0 else min(
+                200, int(round(pct * (127.0 / vol) ** (1.0 / 3.0))))
+            sh(PACTL, "set-sink-input-volume", str(si["id"]), "%d%%" % eff)
+        return
+
+
+def _avrcp_seed():
+    """Populate _avrcp_state from transports that already exist (daemon
+    started while the phone was connected) — without this, PC->phone sync is
+    dead until the first button press creates the state entry."""
+    r = sh(BUSCTL, "tree", "org.bluez", "--list")
+    if r.returncode != 0:
+        return
+    for line in r.stdout.splitlines():
+        m = re.match(r"\s*(/org/bluez/[^/]+/dev_([0-9A-Fa-f_]+)/sep\d+/fd\d+)\s*$",
+                     line)
+        if not m:
+            continue
+        path, mac = m.group(1), m.group(2)
+        rv = sh(BUSCTL, "get-property", "org.bluez", path,
+                "org.bluez.MediaTransport1", "Volume")
+        mv = re.match(r"q (\d+)", rv.stdout.strip()) if rv.returncode == 0 else None
+        if mv:
+            with _avrcp_lock:
+                _avrcp_state[mac] = {"vol": int(mv.group(1)), "path": path,
+                                     "phone_ts": 0.0}
+
+
+def _avrcp_watch():
+    """Follow MediaTransport1 Volume changes via dbus-monitor (event-driven,
+    the bluetooth counterpart of `pactl subscribe`). Respawns on exit."""
+    match = ("type='signal',interface='org.freedesktop.DBus.Properties',"
+             "member='PropertiesChanged',arg0='org.bluez.MediaTransport1'")
+    while True:
+        try:
+            _avrcp_seed()
+        except Exception:
+            pass
+        try:
+            p = subprocess.Popen([DBUS_MONITOR, "--system", match],
+                                 stdout=subprocess.PIPE, text=True)
+        except Exception:
+            time.sleep(5.0)
+            continue
+        mac = ""
+        path = ""
+        pending = False
+        for line in p.stdout:
+            m = re.search(r"path=(/org/bluez/[^/]+/dev_([0-9A-Fa-f_]+)/\S*)", line)
+            if m:
+                path, mac = m.group(1), m.group(2)
+                pending = False
+                continue
+            if '"Volume"' in line:
+                pending = True
+                continue
+            if pending:
+                pending = False
+                mv = re.search(r"uint16 (\d+)", line)
+                if mv and mac:
+                    vol = int(mv.group(1))
+                    with _avrcp_lock:
+                        st = _avrcp_state.setdefault(
+                            mac, {"vol": None, "path": path, "phone_ts": 0.0})
+                        st["path"] = path
+                        # our own write-back echoes with the same value
+                        echo = st["vol"] is not None and abs(st["vol"] - vol) <= 1
+                        st["vol"] = vol
+                        if not echo:
+                            st["phone_ts"] = time.time()
+                    if not echo:
+                        try:
+                            _avrcp_apply(mac, vol)
+                        except Exception:
+                            pass
+        p.wait()
+        with _avrcp_lock:
+            _avrcp_state.clear()   # transports gone (bluez/monitor restart)
+        time.sleep(2.0)
 
 
 def reconcile():
@@ -1343,9 +1542,17 @@ def _reconcile_locked():
         # New stream on this slot? Apply the APP's saved post-leveler trim (so
         # trims survive restarts / reassignment) rather than inheriting the
         # previous stream's offset. Unknown apps start matched (100%).
+        # Bluetooth A2DP-source streams are volume-synced with the sending
+        # device (AVRCP): the DEVICE's current volume is the trim, never a
+        # saved default — a phone at 0 must not come back at 100.
+        bt_mac = _avrcp_mac_of(si.get("node_name", ""))
         if _slot_stream.get(slot) != sid:
             _slot_stream[slot] = sid
             offset = _trims.get(key, 100)
+            if bt_mac:
+                known = _avrcp_known_pct(bt_mac)
+                if known is not None:
+                    offset = known
             _set_out_vol(slot, offset, out_ids)
         else:
             offset = _get_sinkinput_vol(out_ids.get(slot)) if slot in out_ids else 100
@@ -1363,6 +1570,11 @@ def _reconcile_locked():
             voice_chains.add(slot)
         _duck_chain_trim[slot] = offset
         seen_trim_keys.add(key)
+        # Bluetooth A2DP-source stream: mirror the trim onto the phone's own
+        # volume display (AVRCP absolute volume). No-op when they already agree.
+        bt_mac = _avrcp_mac_of(si.get("node_name", ""))
+        if bt_mac:
+            _avrcp_sync_to_phone(bt_mac, offset)
         rows.append({"key": key, "ids": [int(sid)], "gain": gains.get(slot, 100),
                      "gain_db": round(gains_db.get(slot, 0.0), 1),
                      "offset": offset, "slot": slot,
@@ -1522,6 +1734,8 @@ def cmd_daemon(_args):
 
     # OUTPUT gain arc: reconstruct applied gain from pre-filter monitor loudness.
     threading.Thread(target=output_gain_loop, daemon=True).start()
+    # Phone volume buttons (AVRCP) -> the stream's post-leveler trim.
+    threading.Thread(target=_avrcp_watch, daemon=True).start()
     # Duck ramp worker: slides volumes between base and dipped on duck edges.
     threading.Thread(target=_duck_ramp_worker, daemon=True).start()
 
