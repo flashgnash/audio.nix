@@ -94,6 +94,11 @@ let
       # chain, and the reference tap on the default sink monitor.
       if (name == "aec_source") return 1
       if (name == "aec_ref") return 1
+      # access-guard mic quarantine: the silent parking sink for ungated
+      # capture streams (modules/access-guard). Its monitor surfaced as a
+      # pickable "mic-quarantine" tile in the input panel (2026-10-08).
+      if (name == "quarantine_mic") return 1
+      if (name ~ /^quarantine_mic\./) return 1
       # mic-blend combiner (Combined Microphones) and its per-mic capture
       # streams (capture.combined_mics*, uniquified by PipeWire) — the
       # input MIX toggle is the representation.
@@ -866,6 +871,11 @@ let
         $2 ~ /^(alsa_input|bluez_input)/ { print $2; exit }'
     }
     if [ "$want" = "on" ]; then
+      # Stand the auto-mic daemon down FIRST (suspend remembers it was on, so
+      # MIX-off below restores it — a plain set-enabled 0 here silently lost
+      # auto-switch for days). The mutate tool HUPs the daemon, so it has
+      # dropped its meters before the blend takes over the routing.
+      ${auto-mic-mutate-sh}/bin/audio-auto-mic-mutate suspend >/dev/null 2>&1 || true
       if [ "$default" = "rnnoise_source" ]; then
         cur=$(${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input)
         [ -n "$cur" ] && [ "$cur" != "combined_mics" ] && printf '%s\n' "$cur" > "$prevfile"
@@ -886,6 +896,12 @@ let
       ${pkgs.procps}/bin/pkill -HUP -f auto-mic-daemon.py 2>/dev/null || true
       ${pkgs.procps}/bin/pkill -USR1 -f mix-sync-daemon.py 2>/dev/null || true
     else
+      # Stand automix down FIRST: while enabled it re-pins combined_mics
+      # within ~1 s of any retarget (verified 2026-10-07), so an OFF that
+      # leaves it running is silently reverted and the MIX toggle appears
+      # stuck on. Mutate HUPs the daemon, which drops the pin before the
+      # retarget below.
+      ${automix-mutate-sh}/bin/audio-automix-mutate set-enabled 0 >/dev/null 2>&1 || true
       prev=$(cat "$prevfile" 2>/dev/null)
       # Only restore a mic that still exists; otherwise fall back.
       pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qxF "$prev" || prev=""
@@ -896,8 +912,10 @@ let
       else
         pactl set-default-source "$prev"
       fi
-      # ...and resume single-mic duty (re-evaluate meters + feed belief).
-      ${pkgs.procps}/bin/pkill -HUP -f auto-mic-daemon.py 2>/dev/null || true
+      # ...and resume single-mic duty: restore auto-switch if the suspend
+      # above disabled it (no-op otherwise). The mutate tool HUPs the daemon,
+      # which re-evaluates meters + feed belief against the restored routing.
+      ${auto-mic-mutate-sh}/bin/audio-auto-mic-mutate resume >/dev/null 2>&1 || true
     fi
     echo done
   '';
@@ -921,7 +939,10 @@ let
     # internal_node(): this map is lookup-only (rows are bounded by what
     # capture.combined_mics* actually captures) and it MUST contain the
     # delayed.* wrappers so they can be unwrapped to the real mic below.
-    sources=$(pactl list sources | awk '
+    # Explicit store paths: this script is also exec'd from daemons whose
+    # systemd PATH has no awk — bare `awk` made blend_streams() silently
+    # empty inside the automix daemon (gain engine no-op'd, 2026-10-05).
+    sources=$(${pkgs.pulseaudio}/bin/pactl list sources | ${pkgs.gawk}/bin/awk '
       ${audio-naming-awk}
       function emit() { if (name != "") printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
       /^Source #/ { emit(); idx = substr($2, 2); name=""; desc=""; port=""; alsa_card=""; alsa_device="" }
@@ -932,7 +953,7 @@ let
       /alsa\.device = / { match($0, /"[^"]*"/); alsa_device = substr($0, RSTART+1, RLENGTH-2) }
       END { emit() }
     ')
-    pactl list source-outputs | awk -v SRC="$sources" '
+    ${pkgs.pulseaudio}/bin/pactl list source-outputs | ${pkgs.gawk}/bin/awk -v SRC="$sources" '
       BEGIN {
         n = split(SRC, lines, "\n")
         for (i = 1; i <= n; i++) {
@@ -1529,7 +1550,7 @@ let
       --client-name=qs-vad --stream-name=qs-vad \
       --property=node.dont-reconnect=true \
       --property=state.restore-target=false 2>/dev/null \
-      | ${vad-python}/bin/python ${vad-meter-py} "$agg"
+      | PYTHONWARNINGS=ignore::UserWarning ${vad-python}/bin/python ${vad-meter-py} "$agg"
   '';
 
   # ── Auto-switch daemon ──────────────────────────────────────────────────────
@@ -1552,11 +1573,17 @@ let
   # seamless swap; otherwise (denoise off) it sets the default source directly.
   # So auto-switch works whether or not denoising is on.
   #
+  # An echo guard makes it deaf to the room's own playback: remote voices out
+  # of the speakers are real speech to every mic, so while a VAD meter on the
+  # default sink's monitor hears speech, selection holds the current mic
+  # (except the dead-mic failover). See "echo_guard" in DEFAULTS.
+  #
   # Config: $XDG_CONFIG_HOME/auto-mic/config.json (auto-created, disabled):
   #   { "enabled": true,
   #     "candidates": ["alsa_input.usb-Blue...", "alsa_input.usb-SteelSeries..."],
   #     "snr_min": 6, "viable_ms": 180, "grace_ms": 150, "hysteresis_ms": 350 }
-  # candidates are source node.names, highest priority first.
+  # candidates are source node.names, highest priority first. "mix_suspended"
+  # is daemon/MIX bookkeeping (see audio-auto-mic-mutate suspend/resume).
   auto-mic-daemon-py = pkgs.writeText "auto-mic-daemon.py" ''
     import json, os, signal, subprocess, threading, time
 
@@ -1599,6 +1626,21 @@ let
         "dead_cut_ms": 150,    # then cut away this fast (vs drop_ms for a walk-away),
                                # for when a mic is muted/unplugged and another hears you
         "vad_agg": 3,          # WebRTC VAD aggressiveness 0..3 (3 = reject non-speech hardest)
+        "echo_guard": True,    # suppress switching while the default OUTPUT is carrying
+                               # speech: remote voices played through speakers reach the
+                               # mics as perfectly valid speech (a Discord call pulled the
+                               # selection off the mic actually in use — seen live
+                               # 2026-10-05). One VAD meter on the default sink's monitor
+                               # is the playback reference; candidate speech that overlaps
+                               # it cannot be trusted to be the user, so selection holds
+                               # the current mic until the playback goes quiet. The DEAD
+                               # cut bypasses this (a muted mic must still fail over).
+        "echo_clear_ms": 400,  # playback must have been speech-free this long before
+                               # switches are considered again (covers the acoustic +
+                               # buffering lag between monitor and room)
+        "echo_guard_agg": 2,   # VAD aggressiveness for the reference meter (the monitor
+                               # is a clean digital signal; 2 catches sung/processed voice
+                               # that 3 would reject)
         "crossfade": True,     # make-before-break linking so no audio is lost at a switch
                                # (denoise-on path only; harmless to leave on)
         "crossfade_ms": 120,   # overlap window where both mics feed the filter at once
@@ -1638,6 +1680,34 @@ let
                                   capture_output=True, text=True, timeout=5).stdout.strip()
         except Exception:
             return ""
+
+    def default_sink():
+        try:
+            return subprocess.run(["pactl", "get-default-sink"],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            return ""
+
+    def sink_is_headphones(name):
+        """Same classification rule as the AEC auto daemon: only sinks we
+        positively KNOW are worn audio (headphone/headset wording or bluez)
+        count; everything else is treated as room speakers."""
+        if not name:
+            return False
+        try:
+            out = subprocess.run(["pactl", "list", "sinks"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return False
+        blk, hay = False, [name]
+        for line in out.splitlines():
+            if line.startswith("\tName:"):
+                blk = line.split(":", 1)[1].strip() == name
+            elif blk and ("Description:" in line or "Active Port:" in line
+                          or "device.form_factor" in line):
+                hay.append(line)
+        import re as _re
+        return bool(_re.search(r"headphone|headset|bluez", " ".join(hay), _re.I))
 
     def set_default(name):
         try:
@@ -1792,6 +1862,8 @@ let
         def __init__(self):
             self.cfg = load_config()
             self.meters = {}        # mic -> Meter (only while auto-switching)
+            self.ref_meter = None   # playback-reference meter (echo guard)
+            self.ref_sink = None    # sink whose monitor the ref meter taps
             self.active_mic = None  # real mic currently feeding the filter
             self.pending = None
             self.pending_since = 0.0
@@ -1867,6 +1939,32 @@ let
             for mic in want:
                 if mic not in self.meters:
                     self.meters[mic] = Meter(mic, self.cfg, self.on_meter_update)
+            # Echo guard: one meter on the default sink's monitor — the
+            # playback reference. Follows the default sink (respawned here on
+            # every node/server event via _schedule_verify) and lives only
+            # while candidate meters do, so it costs nothing when auto is off.
+            sink = default_sink() if (want and self.cfg.get("echo_guard", True)) else ""
+            # Headphone-class output: no acoustic path from playback to the
+            # room mics (and the Arctis earcups measurably don't even reach
+            # their own boom mic), so a guard here only does harm — audio
+            # playing in the user's EARS froze all switching, and walking
+            # away while listening never handed off (2026-10-06). Guard only
+            # when the room can hear the playback, same classification as
+            # the AEC auto daemon.
+            if sink and sink_is_headphones(sink):
+                sink = ""
+            if self.ref_meter is not None and (
+                    not sink or self.ref_sink != sink or not self.ref_meter.alive()):
+                self.ref_meter.stop()
+                self.ref_meter = None
+                self.ref_sink = None
+            if sink and self.ref_meter is None:
+                rcfg = dict(self.cfg)
+                rcfg["vad_agg"] = int(self.cfg.get("echo_guard_agg", 2))
+                # No selection callback: playback windows must never drive a
+                # selection tick, only taint coincident candidate speech.
+                self.ref_meter = Meter(sink + ".monitor", rcfg, lambda: None)
+                self.ref_sink = sink
 
         def route(self, mic):
             # Always send the chosen mic THROUGH the filter (make-before-break
@@ -1959,6 +2057,21 @@ let
             if self.mix_active:
                 self.pending = None
                 return
+            # Echo guard: while the playback reference carries (recent) speech,
+            # any speech the candidates hear may just be the speakers — remote
+            # voices register as fully viable speech on every mic and yanked
+            # the selection off the mic actually in use. Hold the current mic;
+            # selection resumes echo_clear_ms after the playback goes quiet.
+            # A DEAD active mic bypasses the guard: muted/unplugged means the
+            # user is silent to everyone, and failing over beats staying deaf.
+            active_dead = (self.active_mic in self.meters
+                           and self.meters[self.active_mic].is_dead(
+                               now, cfg["dead_hold_ms"]))
+            if (self.ref_meter is not None and not active_dead
+                    and (now - self.ref_meter.last_voiced) * 1000.0
+                        < cfg.get("echo_clear_ms", 400)):
+                self.pending = None
+                return
             cands = self._candidates()
 
             def is_viable(m, snr):
@@ -2012,8 +2125,7 @@ let
             # another is hearing you, cut across fast instead of waiting out the
             # normal walk-away delay (overrides the flap hold: a dead mic means
             # silence, so getting audible again beats damping the ping-pong).
-            if (self.active_mic in self.meters
-                    and self.meters[self.active_mic].is_dead(now, cfg["dead_hold_ms"])):
+            if active_dead:
                 threshold = cfg["dead_cut_ms"]
             if (now - self.last_switch) * 1000.0 < cfg["settle_ms"]:
                 return
@@ -2190,6 +2302,9 @@ let
                     with self.lock:
                         if self.system_active():
                             self.ensure_default_rnnoise()
+                    # A default-SINK change moves the playback reference —
+                    # the debounced node handler re-resolves the ref meter.
+                    self._schedule_verify()
                 elif " on source #" in line and ("'new'" in line or "'remove'" in line):
                     # NB: " on source #" — a bare " on source" also matches
                     # "on source-output", i.e. every app stream open/close.
@@ -2207,12 +2322,49 @@ let
                 self.reload.clear()
                 self.apply_state()
 
+        # ── stale MIX-suspension heal (startup only) ──────────────────────
+        # MIX suspends auto-switch via config (enabled=false, mix_suspended=
+        # true; see audio-auto-mic-mutate suspend/resume). The matching
+        # resume runs when MIX is turned OFF — but a reboot/crash tears MIX
+        # down without one, which would leave auto-switch silently disabled
+        # forever (exactly how it was lost for days in 2026-10). On startup,
+        # a suspension with no live blend is stale: resume it. One-shot and
+        # deliberately delayed so the graph (and any genuinely restored MIX
+        # routing) is up before we judge; NOT run on SIGHUP — during a MIX
+        # enable the suspend flags land before the blend routing does, and
+        # healing in that window would re-enable auto mid-transition.
+        def heal_suspend(self):
+            try:
+                cfg = load_config()
+                if not cfg.get("mix_suspended"):
+                    return
+                if self.mix_on() or default_source() == "combined_mics":
+                    return          # MIX really is active; suspension stands
+                try:
+                    with open(CONFIG) as f:
+                        raw = json.load(f)
+                except Exception:
+                    raw = {}
+                raw["enabled"] = True
+                raw["mix_suspended"] = False
+                tmp = CONFIG + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(raw, f, indent=2)
+                os.replace(tmp, CONFIG)
+                log("resumed auto-switch (stale MIX suspension after restart)")
+                self.reload.set()
+            except Exception as e:
+                log("suspend heal failed:", e)
+
         def run(self):
             ensure_config()
             log("started; config", CONFIG)
             self.apply_state()
             threading.Thread(target=self.reload_loop, daemon=True).start()
             self._schedule_verify()   # cover nodes that appear before subscribe attaches
+            t = threading.Timer(3.0, self.heal_suspend)
+            t.daemon = True
+            t.start()
             self.watch_default()                 # blocks main thread; event-driven
 
     def main():
@@ -2264,6 +2416,8 @@ let
   # Mutate the config. Subcommands:
   #   toggle-enabled            flip the master auto-switch on/off
   #   set-enabled <1|0>         force the master auto-switch on/off
+  #   suspend                   MIX on: disable auto-switch, remember it was on
+  #   resume                    MIX off: re-enable iff suspend disabled it
   #   toggle <source.name>      add the mic to the candidate set, or remove it
   #   up|down <source.name>     move the mic earlier/later in priority
   auto-mic-mutate-sh = pkgs.writeShellScriptBin "audio-auto-mic-mutate" ''
@@ -2277,10 +2431,24 @@ let
       toggle-enabled)
         "$jq" '.enabled = ((.enabled // false) | not)' "$cfg" > "$tmp" ;;
       set-enabled)
-        # $name is "1" or "0" — used by the MIX toggle to force auto off
-        # (blend and auto-switch are mutually exclusive routing modes).
+        # $name is "1" or "0" — force the master auto-switch on/off. Clears
+        # any MIX suspension: an explicit user choice outranks the memo that
+        # MIX turned auto off (otherwise a later MIX-off resume would undo it).
         "$jq" --argjson v "$([ "$name" = "1" ] && echo true || echo false)" \
-          '.enabled = $v' "$cfg" > "$tmp" ;;
+          '.enabled = $v | .mix_suspended = false' "$cfg" > "$tmp" ;;
+      suspend)
+        # MIX turned on: stand auto-switch down, but REMEMBER it was on so
+        # MIX-off restores it. One-way set-enabled 0 here is how auto-switch
+        # got silently lost for days (MIX on Sep 30 2026, never restored).
+        "$jq" 'if .enabled == true
+               then .enabled = false | .mix_suspended = true
+               else . end' "$cfg" > "$tmp" ;;
+      resume)
+        # MIX turned off: restore auto-switch ONLY if MIX was what disabled
+        # it — a user who had auto off keeps it off.
+        "$jq" 'if .mix_suspended == true
+               then .enabled = true | .mix_suspended = false
+               else . end' "$cfg" > "$tmp" ;;
       toggle)
         "$jq" --arg n "$name" '
           .candidates = (.candidates // []) |
@@ -2386,7 +2554,15 @@ let
     titlesfile=$(mktemp)
     namesfile=$(mktemp)
     sinksfile=$(mktemp)
-    trap "rm -f $titlesfile $namesfile $sinksfile" EXIT
+    btfile=$(mktemp)
+    trap "rm -f $titlesfile $namesfile $sinksfile $btfile" EXIT
+
+    # bluez card MAC -> form factor (phone/headset/speaker/...), so bluetooth
+    # A2DP-source streams can carry a device-type icon class.
+    pactl list cards 2>/dev/null | awk '
+      /^\tName: bluez_card\./ { mac=substr($2, 12) }
+      /device\.form_factor/   { split($0, a, "\""); if (mac != "") { print mac "\001" a[2]; mac="" } }
+    ' > "$btfile" || true
 
     hyprctl clients -j 2>/dev/null \
       | ${pkgs.jq}/bin/jq -r '.[] | [(.pid|tostring), .title] | join("\u0001")' \
@@ -2441,7 +2617,7 @@ let
           esac
         done > "$namesfile"
 
-    pactl list sink-inputs | awk -v tf="$titlesfile" -v nf="$namesfile" -v sf="$sinksfile" '
+    pactl list sink-inputs | awk -v tf="$titlesfile" -v nf="$namesfile" -v sf="$sinksfile" -v bf="$btfile" '
       ${audio-naming-awk}
       BEGIN {
         while ((getline line < tf) > 0) {
@@ -2459,6 +2635,11 @@ let
           if (n >= 2) sinknames[sp[1]] = sp[2]
         }
         close(sf)
+        while ((getline line < bf) > 0) {
+          idx = index(line, "\001")
+          if (idx > 0) btform[substr(line,1,idx-1)] = substr(line,idx+1)
+        }
+        close(bf)
       }
       # Internal plumbing streams are not apps — the canonical internal_node()
       # mask hides them: output.combined_out* duplicator streams get their own
@@ -2470,17 +2651,28 @@ let
       # their gauges. Vesktop feed streams PARKED on a discord_user_* null-sink
       # are hidden by their sink: the per-user bridge is that voice, and a
       # visible feed gauge would fight the split (PerUserAudioSinks).
-      function emit() {
+      function emit(    mac, ff) {
         if (id == "" || internal_node(nodename)) return
         if (sinknames[sinkidx] ~ /^discord_user_/) return
         title = (pid in titles) ? titles[pid] : ""
         if (pid in enames) name = enames[pid]
+        # Streams with no owning application (bluez A2DP sources etc.) carry
+        # the device description instead — show that rather than "Unknown",
+        # and a synthetic bt-device:<form-factor> binary so the gauge can
+        # icon them by device type instead of the unknown glyph.
+        if (name == "Unknown" && devdesc != "") name = devdesc
+        if (binary == "" && nodename ~ /^bluez_input\./) {
+          mac = nodename; sub(/^bluez_input\./, "", mac); sub(/\.[0-9]+$/, "", mac)
+          ff = (mac in btform) ? btform[mac] : "unknown"
+          binary = "bt-device:" ff
+        }
         printf "%s|%s|%s|%s|%s|%s|%s\n", id, name, vol, muted, binary, corked, title
       }
       /^Sink Input #/ {
         emit()
-        id = substr($3, 2); name = "Unknown"; vol = 100; muted = 0; binary = ""; pid = ""; nodename = ""; corked = 0; sinkidx = ""
+        id = substr($3, 2); name = "Unknown"; vol = 100; muted = 0; binary = ""; pid = ""; nodename = ""; corked = 0; sinkidx = ""; devdesc = ""
       }
+      /device\.description/          { split($0, a, "\""); if (length(a) > 1) devdesc = a[2] }
       /^\tSink:/    { sinkidx = $2 }
       /Corked:/    { corked = ($2 == "yes") ? 1 : 0 }
       /Mute:/      { muted = ($2 == "yes") ? 1 : 0 }
@@ -2563,6 +2755,45 @@ let
                 return set(json.load(f).get("sources") or [])
         except Exception:
             return set()
+
+    AUTOMIX_CONFIG = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "audio-automix", "config.json")
+
+    def automix_plan():
+        """(members, tie_sets) from an ENABLED automix config, else None.
+        members = every automix mic (they define blend membership while
+        automix owns the mix). tie_sets = mics sharing group+priority — the
+        only mics that are ever OPEN simultaneously, hence the only ones
+        whose delays must align. A solo-priority mic (the typical good desk
+        mic) gets ZERO padding: automix gates fallbacks instead of mixing
+        them, so padding the primary to the slowest mic — what the legacy
+        global alignment does — would buy nothing and cost ~46 ms of live
+        latency (Arctis radio transit)."""
+        try:
+            with open(AUTOMIX_CONFIG) as f:
+                cfg = json.load(f)
+            if not cfg.get("enabled"):
+                return None
+            members, ties = [], []
+            for g in cfg.get("groups") or []:
+                by_p = {}
+                for m in g.get("mics") or []:
+                    n = m.get("node")
+                    if not n:
+                        continue
+                    members.append(n)
+                    try:
+                        p = int(m.get("priority", 1))
+                    except Exception:
+                        p = 1
+                    by_p.setdefault(p, []).append(n)
+                ties.extend([ms for ms in by_p.values() if len(ms) > 1])
+            if not members:
+                return None
+            return (members, ties)
+        except Exception:
+            return None
 
     RATE = 48000
     REC_S = 12           # calibration recording length
@@ -2728,11 +2959,42 @@ let
 
         def sync_wrappers(self):
             with self.lock:
-                mics = real_mics()
-                chosen = mix_set_sources()
-                if chosen:                         # non-empty = blend only these
-                    mics = [m for m in mics if m in chosen]
-                want = self.delays(mics)
+                present = real_mics()
+                plan = automix_plan()
+                if plan is not None:
+                    # Automix owns the blend: membership from its groups,
+                    # alignment only within tie-tiers (see automix_plan).
+                    members, ties = plan
+                    mics = [m for m in present if m in members]
+                    # Fallback (verified silent-mic condition 2026-10-07): if
+                    # EVERY member is absent (boot race, all unplugged) an
+                    # empty wrap list leaves combined_mics with no capture
+                    # streams at all — the whole chain goes silent even with
+                    # healthy non-member mics plugged in. Any present mic
+                    # beats guaranteed silence, so wrap them all until a
+                    # member returns (then membership snaps back).
+                    if not mics and present:
+                        log("automix members all absent; blending present mics:", present)
+                        mics = present
+                    want = {m: 0.0 for m in mics}
+                    for tie in ties:
+                        sub = [m for m in tie if m in want]
+                        if len(sub) > 1:
+                            top = max(self.lags.get(m, 0.0) for m in sub)
+                            for m in sub:
+                                want[m] = max(0.0, top - self.lags.get(m, 0.0))
+                else:
+                    chosen = mix_set_sources()
+                    mics = present
+                    if chosen:                     # non-empty = blend only these
+                        mics = [m for m in present if m in chosen]
+                        # Same fallback for the legacy mix-set: it persists
+                        # across sessions, so a set seeded on a since-removed
+                        # mic would otherwise leave the blend empty forever.
+                        if not mics and present:
+                            log("mix-set mics all absent; blending present mics:", present)
+                            mics = present
+                    want = self.delays(mics)
                 for mic in list(self.wrappers):
                     p, d = self.wrappers[mic]
                     dead = p.poll() is not None
@@ -2846,6 +3108,1385 @@ let
   mix-sync-daemon-sh = pkgs.writeShellScriptBin "audio-mix-sync-daemon" ''
     export PATH="${pkgs.pulseaudio}/bin:${pkgs.pipewire}/bin:$PATH"
     exec ${pkgs.python3}/bin/python ${mix-sync-daemon-py}
+  '';
+
+  # ── Automix: gain-based successor to the auto-mic switcher ─────────────────
+  # The switcher's fragility all lived in per-decision GRAPH mutation (re-link
+  # the filter input, sweep strays, fight WirePlumber); every live failure —
+  # doubled voice, dead feed after a switch, stuck selections — was that layer.
+  # Automix keeps the graph STATIC: every member mic feeds combined_mics
+  # permanently, combined_mics feeds the AEC→RNNoise chain, and decisions are
+  # volume ramps on the combiner's per-mic capture streams. A wrong decision is
+  # briefly suboptimal audio, never a dead mic.
+  #
+  # Config: $XDG_CONFIG_HOME/audio-automix/config.json
+  #   { "enabled": false,
+  #     "groups": [ { "name": "Group 1", "enabled": true,
+  #                   "mics": [ {"node": "alsa_input...", "priority": 1},
+  #                             {"node": "alsa_input...", "priority": 2} ] } ] }
+  # A group with "enabled": false stays configured but fully gated (the UI
+  # group-tab checkbox).
+  # Groups are independent people/channels: they always MIX with each other.
+  # Within a group, priorities form tiers (lower number = preferred): the
+  # highest-priority tier with speech evidence is OPEN (all its mics at their
+  # trim volume), every other tier is GATED (near-silent). Equal priorities =
+  # one tier = plain blend. Decisions reuse the auto-mic evidence stack: VAD
+  # meters per mic, min-stat noise floors, the playback echo guard, dead-mic
+  # fast failover. See auto-mic-daemon-py above for the rationale behind each
+  # knob; the semantics here are per-GROUP instead of global.
+  #
+  # Latency: mix-sync aligns delays only within a tie-tier (see its
+  # automix-aware delay policy) — a solo-priority mic (the usual "good desk
+  # mic") is never padded to match a slower fallback mic.
+  automix-config-path = ''"''${XDG_CONFIG_HOME:-$HOME/.config}/audio-automix/config.json"'';
+
+  automix-daemon-py = pkgs.writeText "automix-daemon.py" ''
+    import json, os, re, signal, subprocess, threading, time
+
+    CONFIG = os.environ.get("AUTOMIX_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "audio-automix", "config.json")
+    TRIMS = os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "audio-automix", "trims.json")
+    BLEED = os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "audio-automix", "bleed.json")
+    ENVS = os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "audio-automix", "envelopes.json")
+    STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "automix-open")
+    VAD_METER = os.environ.get("AUTOMIX_VAD_METER") or "qs-vad-meter"
+    SET_INPUT = os.environ.get("AUTOMIX_SET_INPUT") or "qs-rnnoise-set-input"
+    GET_INPUT = os.environ.get("AUTOMIX_GET_INPUT") or "qs-rnnoise-current-input"
+    LIST_BLEND = os.environ.get("AUTOMIX_LIST_BLEND") or "audio-list-blend-mics"
+    AUTOMIC_MUTATE = os.environ.get("AUTOMIX_AUTOMIC_MUTATE") or "audio-auto-mic-mutate"
+    RN_SOURCE = "rnnoise_source"
+    COMBINED = "combined_mics"
+    GATE_PCT = 2         # cubic pactl %, ~ -100 dB: inaudible but stream stays live
+
+    DEFAULTS = {
+        "enabled": False,
+        "groups": [],
+        # Evidence thresholds — same meanings as the auto-mic daemon's.
+        "snr_min": 6.0,
+        "near_snr": 14.0,
+        "stick_db": 3.0,
+        "viable_ms": 180,
+        "grace_ms": 150,
+        "hysteresis_ms": 200,   # move UP to a preferred tier
+        "drop_ms": 1200,        # fall DOWN to a fallback tier (walk-away)
+        "settle_ms": 400,
+        "flap_window_ms": 8000,
+        "flap_hold_ms": 3000,
+        "dead_level": 4.0,
+        "dead_hold_ms": 150,
+        "dead_cut_ms": 150,
+        "vad_agg": 3,
+        "echo_guard": True,
+        "echo_clear_ms": 400,
+        "echo_guard_agg": 2,
+        # ── per-mic speech ENVELOPES (the no-magic-numbers endgame) ──────
+        # Each mic LEARNS what "hearing you well" means for IT: a max-biased
+        # envelope of the SNR it sees while it is the open mic and you are
+        # speaking. All position bars derive from the mic's own envelope as
+        # RELATIVE drops, so a hot headset and a modest desk mic stop being
+        # judged on one universal scale — the single global near_snr made
+        # lean-back and walk-away UNFIXABLE together (tune for one, break
+        # the other; lived twice, 2026-10-06). Until a mic has an envelope
+        # (~20 s of open speech), the global constants apply unchanged.
+        "env_near_frac": 0.6,       # "near"/"comfortable" = this FRACTION of
+                                    # the mic's learned envelope (clamped
+                                    # 8..20). A fraction scales with however
+                                    # loud the envelope really is; the fixed
+                                    # -dB drops it replaced only worked at
+                                    # one magnitude (env 19 -> unleavable
+                                    # bar 7; env 34 -> churn bar 22, both
+                                    # lived 2026-10-06). Near and immune are
+                                    # ONE judgment: no band between them for
+                                    # dominance to exploit (the lean-back
+                                    # steal); dominance acts only in the
+                                    # stick-discount cling zone below near
+                                    # (the walk-away stall it exists for).
+        "env_min_db": 15.0,         # envelope floor (sanity clamp)
+        "bleed_margin_db": 8.0,  # playback-credibility margin: while the
+                               # speakers carry voice, a mic's speech evidence
+                               # counts only if its SNR beats the mic's OWN
+                               # measured playback bleed by this much. Replaces
+                               # the blunt freeze — switching works THROUGH
+                               # continuous playback once profiles are learned,
+                               # and an out-of-earshot mic (bleed ~0) is always
+                               # credible. Margins are relative, so this
+                               # transfers across rooms/volumes/mics.
+        "dominate_db": 8.0,    # a tier hearing you THIS much more clearly than
+                               # the open tier takes over even while the open
+                               # tier still scrapes its bar: walking away left
+                               # the desk mic at SNR ~12 (distant but "near")
+                               # while the headset read ~23 — without this the
+                               # handoff waits for the desk mic to fully lose
+                               # you (~6 extra seconds, traced 2026-10-06)
+        "dominate_ms": 300,    # hold time for a dominance switch — short on
+                               # purpose: the dB differential is the evidence,
+                               # and every extra ms is spent on a mic that is
+                               # gating/garbling distant speech
+        "shadow_ms": 300,      # SEAMLESSNESS: opening an extra mic is nearly
+                               # free in a gain mixer, staying deaf is not —
+                               # when the open tier is weak WHILE another tier
+                               # hears speech, and that mismatch SUSTAINS this
+                               # long, the other tier shadow-opens (full trim)
+                               # without waiting for switch-grade confidence;
+                               # the real handoff decision proceeds underneath.
+                               # Long enough that at-desk sentence starts
+                               # (mismatch for ~100 ms) never double the
+                               # voice; short enough that mid-walk speech is
+                               # carried before the open mic degrades far.
+        "shadow_linger_ms": 800,  # shadow closes this long after the open
+                               # tier is confidently strong again (false
+                               # alarm: user stayed at the mic)
+        "shadow_max_ms": 2500, # hard deadline on the overlap: past this the
+                               # shadow either promotes to open (open tier
+                               # still weak — it has proven itself) or is
+                               # about to be lingered closed. Dual-open is a
+                               # bridge, never a steady state (doubled voice
+                               # in the acoustic in-between, 2026-10-06)
+        "shadow_gain_db": -10.0,  # the shadow rides UNDER the open mic, not
+                               # beside it: the two mics sit ~30 ms apart
+                               # (wireless transit; true alignment would cost
+                               # the primary mic that latency permanently —
+                               # rejected), so an equal-level overlap reads
+                               # as a double voice. A -10 dB shade still
+                               # carries every walk-away word and promotes
+                               # to full trim the moment it wins.
+        "gate_autofit": True,  # auto-calibrate the chain's post-RNNoise level
+                               # gate: track the USER'S measured speech level at
+                               # the chain output and keep the gate threshold a
+                               # RELATIVE margin below it. Absolute dBFS
+                               # thresholds don't transfer across mics/gains/
+                               # rooms (explicit user requirement 2026-10-06);
+                               # a speech-relative margin does. The values in
+                               # pipewire.nix are cold-boot seeds only.
+        "gate_margin_db": 25.0,  # threshold sits this far below tracked speech
+        "gate_noise_headroom_db": 6.0,  # ...but always this far ABOVE the
+                               # tracked residue ceiling: speech-25 alone put
+                               # the gate under the loudest fan-residue
+                               # moments, and the leaks flashed Discord's
+                               # speaking indicator (2026-10-06). Every leak
+                               # is a non-voiced output window that teaches
+                               # the calibrator where that ceiling is.
+        "gate_min_db": -60.0,  # clamp: never so low the gate stops gating...
+        "gate_max_db": -35.0,  # ...nor so high it can eat quiet speech
+        "gate_speech_ms": 300,  # the autofit only LEARNS the speech level from
+                               # a voiced run sustained at least this long. A
+                               # keyboard click or fan burst trips RNNoise's
+                               # VAD for a frame or two at high SNR; without a
+                               # duration floor the calibrator banked those as
+                               # "speech", dragging the tracked level (and the
+                               # gate with it) into the floor whenever the user
+                               # was quiet but the room was not (2026-10-09).
+                               # Real speech sustains well past 300 ms; impulse
+                               # noise cannot. Longer than the 180 ms mic-
+                               # SELECTION viability bar on purpose: mis-banking
+                               # the calibration is costlier than a momentary
+                               # wrong mic pick.
+        "crossfade_ms": 120,    # gain ramp length (make-before-break)
+        "ramp_steps": 4,
+    }
+
+    def log(*a):
+        print("[automix]", *a, flush=True)
+
+    def load_config():
+        cfg = dict(DEFAULTS)
+        try:
+            with open(CONFIG) as f:
+                user = json.load(f)
+            if isinstance(user, dict):
+                cfg.update(user)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log("config parse error, using defaults:", e)
+        return cfg
+
+    def ensure_config():
+        if os.path.exists(CONFIG):
+            return
+        try:
+            os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+            with open(CONFIG, "w") as f:
+                json.dump({"enabled": False,
+                           "groups": [{"name": "Group 1", "mics": []}]}, f, indent=2)
+            log("wrote default disabled config at", CONFIG)
+        except Exception as e:
+            log("could not write default config:", e)
+
+    def run_out(cmd, timeout=5):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout).stdout
+        except Exception:
+            return ""
+
+    def default_source():
+        return run_out(["pactl", "get-default-source"]).strip()
+
+    def default_sink():
+        return run_out(["pactl", "get-default-sink"]).strip()
+
+    def sink_is_headphones(name):
+        """Same classification rule as the AEC auto daemon: only sinks we
+        positively KNOW are worn audio (headphone/headset wording or bluez)
+        count; everything else is treated as room speakers."""
+        if not name:
+            return False
+        out = run_out(["pactl", "list", "sinks"])
+        blk, hay = False, [name]
+        for line in out.splitlines():
+            if line.startswith("\tName:"):
+                blk = line.split(":", 1)[1].strip() == name
+            elif blk and ("Description:" in line or "Active Port:" in line
+                          or "device.form_factor" in line):
+                hay.append(line)
+        return bool(re.search(r"headphone|headset|bluez", " ".join(hay), re.I))
+
+    def present_sources():
+        out = run_out(["pactl", "list", "short", "sources"])
+        names = set()
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                names.add(parts[1])
+        return names
+
+    # The combiner's per-mic capture streams: {real mic -> (stream id, vol %)}.
+    # LIST_BLEND already unwraps the delayed.<mic> wrappers to the real mic.
+    def blend_streams():
+        res = {}
+        for line in run_out([LIST_BLEND]).splitlines():
+            parts = line.split("|")
+            if len(parts) >= 4:
+                try:
+                    res[parts[1]] = (parts[0], int(parts[3]))
+                except ValueError:
+                    pass
+        return res
+
+    def set_stream_vol(sid, pct):
+        try:
+            subprocess.run(["pactl", "set-source-output-volume", sid,
+                            "%d%%" % int(pct)], timeout=5,
+                           stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    # One VAD meter per mic — identical machinery to the auto-mic daemon's
+    # (see its Meter class comments for the field semantics).
+    class Meter:
+        def __init__(self, mic, cfg, on_line):
+            self.mic = mic
+            self.grace_s = cfg["grace_ms"] / 1000.0
+            self.dead_level = cfg["dead_level"]
+            self.on_line = on_line
+            self.lock = threading.Lock()
+            self.snr = 0.0
+            self.level = 100.0
+            self.last_line = 0.0
+            self.dead_since = None
+            self.last_voiced = 0.0
+            self.voice_start = 0.0
+            self.snr_ewma = 0.0
+            self.proc = subprocess.Popen([VAD_METER, mic, str(cfg["vad_agg"])],
+                                         stdout=subprocess.PIPE,
+                                         text=True, start_new_session=True)
+            self.thread = threading.Thread(target=self._read, daemon=True)
+            self.thread.start()
+
+        def _read(self):
+            for line in self.proc.stdout:
+                parts = line.split()
+                if len(parts) != 3:
+                    continue
+                try:
+                    sp, snr, level = int(parts[0]), float(parts[1]), float(parts[2])
+                except ValueError:
+                    continue
+                now = time.monotonic()
+                with self.lock:
+                    self.level = level
+                    self.last_line = now
+                    if level < self.dead_level:
+                        if self.dead_since is None:
+                            self.dead_since = now
+                    else:
+                        self.dead_since = None
+                    if sp:
+                        if (now - self.last_voiced) > self.grace_s:
+                            self.voice_start = now
+                            self.snr_ewma = snr
+                        else:
+                            self.snr_ewma = 0.5 * snr + 0.5 * self.snr_ewma
+                        self.last_voiced = now
+                        self.snr = snr
+                if sp:
+                    try:
+                        self.on_line()
+                    except Exception:
+                        pass
+
+        def viable(self, now, snr_min, viable_ms):
+            with self.lock:
+                if (now - self.last_voiced) > self.grace_s:
+                    return False
+                if self.snr_ewma < snr_min:
+                    return False
+                return (now - self.voice_start) * 1000.0 >= viable_ms
+
+        def alive(self):
+            return self.proc.poll() is None
+
+        def is_dead(self, now, hold_ms):
+            with self.lock:
+                if (now - self.last_line) > 0.5:
+                    return False
+                return (self.dead_since is not None
+                        and (now - self.dead_since) * 1000.0 >= hold_ms)
+
+        def stop(self):
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
+
+    # Per-group tier state machine. Decisions mirror the auto-mic daemon's
+    # _select, generalised mic -> tier: a tier's evidence is its best member's.
+    class Group:
+        def __init__(self, idx, name):
+            self.idx = idx
+            self.name = name
+            self.enabled = True    # unticked group = present but fully gated
+            self.tiers = []        # [(priority, [mics])] ascending priority number
+            self.open_tier = None  # priority number currently open (None = none yet)
+            self.shadow_tier = None   # extra tier held open mid-transition
+            self.shadow_since = 0.0   # monotonic the shadow opened
+            self.shadow_strong = 0.0  # monotonic the open tier last looked strong
+            self.mismatch_since = 0.0 # monotonic the shadow CONDITION began
+            self.pending = None
+            self.pending_since = 0.0
+            self.last_switch = 0.0
+            self.left_at = {}      # tier -> monotonic when last closed
+
+        def set_mics(self, mics):
+            by_prio = {}
+            for m in mics:
+                try:
+                    p = int(m.get("priority", 1))
+                except Exception:
+                    p = 1
+                by_prio.setdefault(p, []).append(m.get("node"))
+            self.tiers = sorted(by_prio.items())
+            prios = [p for p, _ in self.tiers]
+            if self.open_tier not in prios:
+                self.open_tier = prios[0] if prios else None
+            if self.shadow_tier not in prios:
+                self.shadow_tier = None
+
+        def all_mics(self):
+            return [m for _, ms in self.tiers for m in ms]
+
+        def _tier_mics(self, prio):
+            for p, ms in self.tiers:
+                if p == prio:
+                    return list(ms)
+            return []
+
+        def open_mics(self):
+            if not self.enabled:
+                return []          # group unticked: everything in it stays gated
+            return self._tier_mics(self.open_tier) if self.open_tier is not None else []
+
+        def shadow_mics(self):
+            # Shadow tier rides along during transitions so the user is
+            # never inaudible while the handoff decision settles — at
+            # REDUCED gain (see shadow_gain_db): the two mics are ~30 ms
+            # apart (wireless transit) and an equal-level overlap reads as
+            # an audible double voice; a -10 dB shade underneath does not.
+            if (not self.enabled or self.shadow_tier is None
+                    or self.shadow_tier == self.open_tier):
+                return []
+            return self._tier_mics(self.shadow_tier)
+
+    class Controller:
+        def __init__(self):
+            self.cfg = load_config()
+            self.meters = {}         # mic -> Meter
+            self.ref_meter = None
+            self.ref_sink = None
+            self.out_meter = None    # rnnoise_source tap (gate auto-calibration)
+            self.speech_db = None    # tracked speech level at the chain output
+            self.noise_db = None     # tracked residue/leak ceiling at the output
+            self.gate_db = None      # last gate threshold we applied
+            self.bleed = {}          # mic -> learned playback-bleed SNR
+            self.bleed_n = {}        # mic -> sample count (gates credibility)
+            self.bleed_dirty = 0.0   # last unsaved-change time (0 = clean)
+            self.env = {}            # mic -> close-speech SNR envelope
+            self.env_n = {}          # mic -> sample count (gates use)
+            self.env_dirty = 0.0
+            self.gate_node = None    # cached rnnoise_source node id
+            self.gate_at = 0.0
+            self.groups = []
+            self.trims = {}          # mic -> open volume pct
+            self.was_enabled = False
+            self.verify_timer = None
+            self.lock = threading.RLock()
+            self.reload = threading.Event()
+            self.load_trims()
+
+        # ── trims (per-mic open volume, persisted) ───────────────────────
+        def load_trims(self):
+            try:
+                with open(TRIMS) as f:
+                    self.trims = {k: int(v) for k, v in json.load(f).items()}
+            except Exception:
+                self.trims = {}
+            try:
+                with open(BLEED) as f:
+                    raw = json.load(f)
+                self.bleed = {k: float(v[0]) for k, v in raw.items()}
+                self.bleed_n = {k: int(v[1]) for k, v in raw.items()}
+            except Exception:
+                self.bleed, self.bleed_n = {}, {}
+            try:
+                with open(ENVS) as f:
+                    raw = json.load(f)
+                self.env = {k: float(v[0]) for k, v in raw.items()}
+                self.env_n = {k: int(v[1]) for k, v in raw.items()}
+            except Exception:
+                self.env, self.env_n = {}, {}
+
+        def save_envs(self):
+            try:
+                os.makedirs(os.path.dirname(ENVS), exist_ok=True)
+                tmp = ENVS + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump({k: [self.env[k], self.env_n.get(k, 0)]
+                               for k in self.env}, f, indent=2)
+                os.replace(tmp, ENVS)
+                self.env_dirty = 0.0
+                log("speech envelopes:", {k[11:31]: round(v, 1)
+                                          for k, v in self.env.items()})
+            except Exception as e:
+                log("env save failed:", e)
+
+        # Per-mic "near" bar: within env_near_drop of THIS mic's learned
+        # close-speech envelope; global near_snr until the envelope exists.
+        def near_bar(self, mic):
+            # FRACTION of the envelope, not an offset: a fixed -12 dB drop
+            # only made sense at one envelope magnitude — with an honest
+            # percentile envelope of 19 it put the bar at 7 (pod unleavable,
+            # walk-away glacial), while at 34 it had put it at 22 (desk
+            # churn). env*0.6 lands proportionally: 19 -> ~12, 26 -> ~16,
+            # 34 -> 20. Clamped to broad sanity rails either way.
+            if self.env_n.get(mic, 0) >= 300 and mic in self.env:
+                return max(8.0, min(20.0,
+                           self.env[mic] * self.cfg.get("env_near_frac", 0.6)))
+            return self.cfg.get("near_snr", 14.0)
+
+        # Comfortable == near, by design (see env_immune_db comment): one
+        # judgment, no band between them for dominance to exploit.
+        def immune_bar(self, mic):
+            if self.env_n.get(mic, 0) >= 300 and mic in self.env:
+                return self.near_bar(mic)
+            return self.cfg.get("near_snr", 14.0) + self.cfg.get("dominate_immune_db", 4.0)
+
+        # Envelope learning: ONLY while the mic is open and carrying real
+        # user speech (that state is what "your close speech on this mic"
+        # means). Max-biased: fast toward louder evidence, glacial decay so
+        # one quiet mumbly hour doesn't erode the reference; floored.
+        def _env_learn(self, now):
+            for g in self.groups:
+                for mic in g.open_mics():
+                    mt = self.meters.get(mic)
+                    if mt is None:
+                        continue
+                    with mt.lock:
+                        voiced = (now - mt.last_voiced) <= mt.grace_s
+                        snr = mt.snr_ewma
+                    if not voiced or snr <= 0:
+                        continue
+                    cur = self.env.get(mic)
+                    if cur is None:
+                        self.env[mic] = max(snr, self.cfg.get("env_min_db", 15.0))
+                    elif snr > cur:
+                        # ~83rd-percentile tracker (5:1 asymmetric EWMA), NOT
+                        # a peak-chaser: the max-biased first version learned
+                        # the user's LOUDEST projection (env 34-35), every
+                        # derived bar landed above their normal relaxed
+                        # speech, and the daemon churned shadow/promote
+                        # cycles while they sat still at the mic
+                        # (2026-10-06 17:01, doubling at the desk).
+                        self.env[mic] = 0.95 * cur + 0.05 * snr
+                    else:
+                        self.env[mic] = max(self.cfg.get("env_min_db", 15.0),
+                                            0.99 * cur + 0.01 * snr)
+                    self.env_n[mic] = self.env_n.get(mic, 0) + 1
+            if self.env_dirty == 0.0:
+                self.env_dirty = now
+            elif (now - self.env_dirty) > 60.0:
+                self.save_envs()
+
+        def save_bleed(self):
+            try:
+                os.makedirs(os.path.dirname(BLEED), exist_ok=True)
+                tmp = BLEED + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump({k: [self.bleed[k], self.bleed_n.get(k, 0)]
+                               for k in self.bleed}, f, indent=2)
+                os.replace(tmp, BLEED)
+                self.bleed_dirty = 0.0
+                log("bleed profiles:", {k[11:31]: round(v, 1)
+                                        for k, v in self.bleed.items()})
+            except Exception as e:
+                log("bleed save failed:", e)
+
+        # ── playback-bleed learning (driven by the REFERENCE meter) ──────
+        # While the speakers carry voice, sample how loudly each candidate
+        # mic hears it. Low-quantile tracking (fast down, slow up): the
+        # user's own intermittent speech during playback spikes upward and
+        # is resisted; sustained pure playback pulls the estimate to the
+        # true bleed. A mic the playback can't reach samples 0 — it becomes
+        # ALWAYS credible (the other-room headset). Estimator-pollution
+        # lesson applied from the start (see the gate noise tracker).
+        def _bleed_sample(self):
+            with self.lock:
+                if not self.enabled():
+                    return
+                now = time.monotonic()
+                for mic, mt in self.meters.items():
+                    with mt.lock:
+                        snr = mt.snr_ewma if (now - mt.last_voiced) <= mt.grace_s else 0.0
+                        lvl = mt.level
+                    # A DEAD mic (powered-off headset) hears nothing and
+                    # would learn bleed ~0 — which flips to "fully credible
+                    # next to the speakers" the moment it powers back on,
+                    # resurrecting the yank bug with authority. The deaf
+                    # don't teach (verified live: off Arctis sampled 471
+                    # windows of 0.0, 2026-10-06).
+                    if lvl < self.cfg.get("dead_level", 4.0):
+                        continue
+                    cur = self.bleed.get(mic)
+                    if cur is None:
+                        self.bleed[mic] = snr
+                    elif snr < cur:
+                        self.bleed[mic] = 0.90 * cur + 0.10 * snr
+                    else:
+                        self.bleed[mic] = 0.99 * cur + 0.01 * snr
+                    self.bleed_n[mic] = self.bleed_n.get(mic, 0) + 1
+                if self.bleed_dirty == 0.0:
+                    self.bleed_dirty = now
+                elif (now - self.bleed_dirty) > 30.0:
+                    self.save_bleed()
+
+        def save_trims(self):
+            try:
+                os.makedirs(os.path.dirname(TRIMS), exist_ok=True)
+                tmp = TRIMS + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(self.trims, f, indent=2)
+                os.replace(tmp, TRIMS)
+            except Exception as e:
+                log("trim save failed:", e)
+
+        def enabled(self):
+            return bool(self.cfg.get("enabled")) and any(
+                g.all_mics() for g in self.groups)
+
+        def member_mics(self):
+            return [m for g in self.groups for m in g.all_mics()]
+
+        # ── graph pinning (ONCE per enable, not per decision) ────────────
+        def pin_graph(self):
+            cur = run_out([GET_INPUT]).strip()
+            if cur != COMBINED:
+                subprocess.run([SET_INPUT, COMBINED], timeout=5)
+            if default_source() != RN_SOURCE:
+                subprocess.run(["pactl", "set-default-source", RN_SOURCE],
+                               timeout=5)
+
+        # ── meters ───────────────────────────────────────────────────────
+        def _sync_meters(self):
+            present = present_sources()
+            want = (set(self.member_mics()) & present) if self.enabled() else set()
+            for mic in list(self.meters):
+                if mic not in want or not self.meters[mic].alive():
+                    self.meters.pop(mic).stop()
+            for mic in want:
+                if mic not in self.meters:
+                    self.meters[mic] = Meter(mic, self.cfg, self.on_meter_update)
+            sink = default_sink() if (want and self.cfg.get("echo_guard", True)) else ""
+            # Headphone-class output: no acoustic path from playback to the
+            # room mics (and the Arctis earcups measurably don't even reach
+            # their own boom mic), so a guard here only does harm — audio
+            # playing in the user's EARS froze all switching, and walking
+            # away while listening never handed off (2026-10-06). Guard only
+            # when the room can hear the playback, same classification as
+            # the AEC auto daemon.
+            if sink and sink_is_headphones(sink):
+                sink = ""
+            if self.ref_meter is not None and (
+                    not sink or self.ref_sink != sink or not self.ref_meter.alive()):
+                self.ref_meter.stop()
+                self.ref_meter = None
+                self.ref_sink = None
+            if sink and self.ref_meter is None:
+                rcfg = dict(self.cfg)
+                rcfg["vad_agg"] = int(self.cfg.get("echo_guard_agg", 2))
+                self.ref_meter = Meter(sink + ".monitor", rcfg, self._bleed_sample)
+                self.ref_sink = sink
+            # Gate auto-calibration tap on the chain OUTPUT: its voiced
+            # windows are by definition the user's speech as every consumer
+            # hears it, on whatever mic/gain this system has.
+            want_out = bool(want) and bool(self.cfg.get("gate_autofit", True))
+            if self.out_meter is not None and (
+                    not want_out or not self.out_meter.alive()):
+                self.out_meter.stop()
+                self.out_meter = None
+            if want_out and self.out_meter is None:
+                self.out_meter = Meter(RN_SOURCE, dict(self.cfg), lambda: None)
+
+        # ── gains ────────────────────────────────────────────────────────
+        # Converge every member stream to its target (trim when open, GATE
+        # when not) with a ramped crossfade: raise opening mics step-by-step
+        # BEFORE lowering closing ones, so the voice never has a gap.
+        def apply_gains(self, ramp=True):
+            streams = blend_streams()
+            opens, closes = [], []
+            open_set, shadow_set = set(), set()
+            for g in self.groups:
+                open_set.update(g.open_mics())
+                shadow_set.update(g.shadow_mics())
+            # cubic pactl %: an X dB shade is pct * 10^(X/60)
+            shade = 10.0 ** (float(self.cfg.get("shadow_gain_db", -10.0)) / 60.0)
+            for mic in self.member_mics():
+                if mic not in streams:
+                    continue        # wrapper not up yet; node event re-applies
+                sid, vol = streams[mic]
+                if mic in shadow_set:
+                    # Reduced-gain overlap carrier. Never learn trims from
+                    # this state — the volume is ours, not the user's.
+                    tgt = max(GATE_PCT + 1, int(round(self.trims.get(mic, 100) * shade)))
+                    if vol != tgt:
+                        opens.append((sid, vol, tgt))
+                elif mic in open_set:
+                    if vol <= GATE_PCT:
+                        # Still at the gate level -> we gated it; open to trim.
+                        opens.append((sid, vol, self.trims.get(mic, 100)))
+                    elif self.trims.get(mic) != vol:
+                        # Already open: the LIVE volume is authoritative — the
+                        # user may have just dragged it, and converging it
+                        # back to the stored trim would stomp that drag.
+                        # Record it as the new trim instead... unless it's a
+                        # shadow level we set ourselves a moment ago (shadow
+                        # just promoted): that one ramps up to the real trim.
+                        if vol == max(GATE_PCT + 1, int(round(self.trims.get(mic, 100) * shade))):
+                            opens.append((sid, vol, self.trims.get(mic, 100)))
+                        else:
+                            self.trims[mic] = vol
+                            self.save_trims()
+                else:
+                    # Leaving open state: whatever the user set while open is
+                    # their trim for next time (volume drags on a GATED mic
+                    # are ignored by design — the gate owns that volume).
+                    # A shadow-level volume is OURS, not a user trim.
+                    if (vol > GATE_PCT and vol != max(
+                            GATE_PCT + 1,
+                            int(round(self.trims.get(mic, 100) * shade)))):
+                        self.trims[mic] = vol
+                        self.save_trims()
+                    if vol != GATE_PCT:
+                        closes.append((sid, vol, GATE_PCT))
+            if not opens and not closes:
+                # Still record the open set: on a no-op pass (e.g. first
+                # apply with everything already at target) the UI's live-open
+                # indicators must not stay blank.
+                self.write_state()
+                return
+            # Every real gain move is logged: "who was at what and where we
+            # sent it" is the ONLY way to see a volume fight (daemon vs
+            # stream-restore vs UI) in the journal after the fact —
+            # intermittent on/off chopping with no trail, 2026-10-06.
+            for sid, v0, v1 in opens:
+                log("gain: stream %s %d%% -> %d%% (open)" % (sid, v0, v1))
+            for sid, v0, v1 in closes:
+                log("gain: stream %s %d%% -> %d%% (gate)" % (sid, v0, v1))
+            steps = max(1, int(self.cfg.get("ramp_steps", 4))) if ramp else 1
+            dt = (self.cfg.get("crossfade_ms", 120) / 1000.0) / steps
+            # Make before break: ramp the opening mics fully up, THEN ramp the
+            # closing ones down — both carry the voice for ~crossfade_ms, which
+            # is a brief overlap instead of a gap (the switcher's hard
+            # retargets clipped words; that failure mode is gone by design).
+            def ramp_all(rows):
+                for i in range(1, steps + 1):
+                    for sid, v0, v1 in rows:
+                        set_stream_vol(sid, v0 + (v1 - v0) * i / steps)
+                    if i < steps:
+                        time.sleep(dt)
+            ramp_all(opens)
+            ramp_all(closes)
+            self.write_state()
+
+        def write_state(self):
+            try:
+                opens = []
+                for g in self.groups:
+                    opens.extend(g.open_mics())
+                    opens.extend(g.shadow_mics())   # live (shaded) counts as open
+                with open(STATE, "w") as f:
+                    f.write("\n".join(opens) + "\n")
+            except Exception:
+                pass
+
+        # True while any OPEN mic is hearing strong, user-grade SNR — the
+        # discriminator between the user actually talking at a mic and
+        # playback/vocals merely passing the output VAD.
+        def _user_speaking(self, now):
+            # "The user is speaking RIGHT NOW" for the gate calibrator. Uses
+            # the same viable() test as mic selection (recent + user-grade SNR
+            # + sustained past gate_speech_ms) so a single VAD-tripping click
+            # or fan burst can never be banked as speech. viable() takes its
+            # own lock — do not hold mt.lock around it.
+            need_ms = self.cfg.get("gate_speech_ms", 300)
+            for g in self.groups:
+                for mic in g.open_mics():
+                    mt = self.meters.get(mic)
+                    if mt is None:
+                        continue
+                    if mt.viable(now, self.near_bar(mic), need_ms):
+                        return True
+            return False
+
+        # ── gate auto-calibration (speech-relative, no absolute numbers) ──
+        # Tracks the user's speech level at the chain output and keeps the
+        # post-RNNoise level gate a RELATIVE margin below it. Absolute dBFS
+        # thresholds don't transfer across mics/gains/rooms (explicit user
+        # requirement 2026-10-06); the margin does. The pipewire.nix values
+        # are cold-boot seeds this overrides after a few seconds of speech.
+        def _gate_autofit(self, now):
+            if not self.cfg.get("gate_autofit", True) or self.out_meter is None:
+                return
+            m = self.out_meter
+            with m.lock:
+                voiced = (now - m.last_voiced) <= m.grace_s
+                since_voiced = now - m.last_voiced
+                lvl = m.level
+            if lvl > 0:
+                db = lvl * 0.7 - 70.0  # meter level 0..100 maps -70..0 dBFS
+                if voiced:
+                    # Learn the speech level ONLY while an open mic hears
+                    # user-grade SNR: vocal music bleeding through the
+                    # speakers VAD-classifies as "speech" at -50ish and
+                    # dragged the tracked level (and the gate) down with it
+                    # (caught passively 2026-10-06). The user at a mic reads
+                    # SNR 20-40; playback bleed reads ~1 — unambiguous.
+                    if self._user_speaking(now):
+                        # Slow EWMA: converges within seconds of real speech,
+                        # follows the user's level, never chases silence.
+                        self.speech_db = db if self.speech_db is None else (
+                            0.98 * self.speech_db + 0.02 * db)
+                elif since_voiced > 5.0:
+                    # NON-voiced audio LONG after any speech = gate leakage
+                    # (fan residue clearing the current threshold). Track its
+                    # ceiling: fast up (a leak is proof), slow decay (so one
+                    # loud-fan day doesn't pin the gate up forever). The 5 s
+                    # standoff is load-bearing: distant/garbled USER SPEECH
+                    # also fails the VAD, and learning it as "noise" during a
+                    # walk-away railed the threshold to 2.6 dB below the
+                    # user's own voice (2026-10-06). Real speech always has
+                    # voiced windows nearby; true fan residue has none.
+                    if self.noise_db is None:
+                        self.noise_db = db
+                    elif db > self.noise_db:
+                        self.noise_db = 0.7 * self.noise_db + 0.3 * db
+                    else:
+                        self.noise_db = 0.995 * self.noise_db + 0.005 * db
+            if not voiced or self.speech_db is None:
+                return
+            if (now - self.gate_at) < 5.0:
+                return
+            self.gate_at = now
+            tgt = self.speech_db - float(self.cfg.get("gate_margin_db", 25.0))
+            # Two-sided: far enough below speech to never clip it, but above
+            # the measured residue ceiling so leaks can't trip consumer VADs.
+            # The noise lift never comes within 6 dB of tracked speech: if
+            # they really are that close, chopped speech is the worse failure
+            # and the flashing indicator is the lesser evil.
+            if self.noise_db is not None:
+                lift = self.noise_db + float(self.cfg.get("gate_noise_headroom_db", 6.0))
+                lift = min(lift, self.speech_db - 6.0)
+                tgt = max(tgt, lift)
+            tgt = max(float(self.cfg.get("gate_min_db", -60.0)),
+                      min(float(self.cfg.get("gate_max_db", -35.0)), tgt))
+            if self.gate_db is not None and abs(tgt - self.gate_db) < 2.0:
+                return
+            if self.gate_node is None:
+                try:
+                    out = run_out(["pw-dump"], timeout=10)
+                    for obj in json.loads(out):
+                        props = ((obj.get("info") or {}).get("props")) or {}
+                        if props.get("node.name") == RN_SOURCE:
+                            self.gate_node = obj["id"]
+                            break
+                except Exception:
+                    return
+            if self.gate_node is None:
+                return
+            lin = 10.0 ** (tgt / 20.0)
+            try:
+                r = subprocess.run(
+                    ["pw-cli", "set-param", str(self.gate_node), "Props",
+                     '{ params = [ "gate:Curve threshold (G)" %.6f ] }' % lin],
+                    capture_output=True, text=True, timeout=5)
+                # pw-cli exits 0 even for dead ids ("no global") — treat error
+                # text as failure and re-resolve next pass (PipeWire restart).
+                if r.returncode != 0 or "error" in (r.stdout + r.stderr).lower():
+                    self.gate_node = None
+                    return
+            except Exception:
+                self.gate_node = None
+                return
+            self.gate_db = tgt
+            log("gate autofit: speech %.1f dB -> threshold %.1f dB"
+                % (self.speech_db, tgt))
+
+        # ── selection (per speech window, per group) ─────────────────────
+        def on_meter_update(self):
+            if not self.enabled():
+                return
+            with self.lock:
+                now_ = time.monotonic()
+                self._env_learn(now_)
+                self._gate_autofit(now_)
+                changed = False
+                for g in self.groups:
+                    if self._select_group(g):
+                        changed = True
+                if changed:
+                    self.apply_gains()
+
+        def _tier_best(self, mics, now, bar, viable_ms, cred=None):
+            # bar: a number, or a callable(mic) -> per-mic bar (envelopes).
+            for m in mics:
+                if cred is not None and not cred(m):
+                    continue
+                mt = self.meters.get(m)
+                b = bar(m) if callable(bar) else bar
+                if mt is not None and mt.viable(now, b, viable_ms):
+                    return True
+            return False
+
+        def _tier_all_dead(self, mics, now, hold_ms):
+            live = [self.meters[m] for m in mics if m in self.meters]
+            if not live:
+                return False
+            return all(mt.is_dead(now, hold_ms) for mt in live)
+
+        def _select_group(self, g):
+            """Returns True if the group's open tier changed."""
+            now = time.monotonic()
+            cfg = self.cfg
+            if not g.tiers or not g.enabled:
+                return False       # unticked group: no selection, gains stay gated
+            open_dead = g.open_tier is not None and self._tier_all_dead(
+                g.open_mics(), now, cfg["dead_hold_ms"])
+            # Playback credibility (replaces the old blanket freeze): while
+            # the speakers carry voice, a mic's evidence counts only if its
+            # SNR beats that mic's LEARNED bleed profile by bleed_margin_db —
+            # so an out-of-earshot mic (bleed ~0) switches freely even mid-
+            # song, the mic you're talking straight into clears its bleed
+            # easily, and a mic hearing ONLY the speakers sits at its bleed
+            # and stays ineligible (the Discord-yank bug stays dead). A mic
+            # with no profile yet (< ~12 s of sampled playback) is treated
+            # as not-credible — identical to the old freeze, converging to
+            # full through-playback switching as profiles fill in. A DEAD
+            # open tier bypasses everything: failing over beats correctness.
+            cred = None
+            if (not open_dead and self.ref_meter is not None
+                    and (now - self.ref_meter.last_voiced) * 1000.0
+                        < cfg.get("echo_clear_ms", 400)):
+                margin = cfg.get("bleed_margin_db", 8.0)
+                def cred(m):
+                    mt = self.meters.get(m)
+                    if mt is None or self.bleed_n.get(m, 0) < 200:
+                        return False
+                    with mt.lock:
+                        s = mt.snr_ewma
+                    return s >= self.bleed.get(m, 0.0) + margin
+
+            # ── shadow-open: never inaudible during a transition ─────────
+            # Opening an extra mic costs a moment of dual pickup; staying
+            # deaf costs WORDS. The instant the open tier stops hearing the
+            # user strongly, the best other tier with any credible speech
+            # evidence opens at full trim alongside it — the real handoff
+            # decision (with all its damping) proceeds underneath, invisible
+            # because audio already flows. A false alarm just lingers
+            # shadow_linger_ms after the open tier proves strong again.
+            shadow_changed = False
+            open_true = g._tier_mics(g.open_tier) if g.open_tier is not None else []
+            open_strong = self._tier_best(
+                open_true, now,
+                lambda m: self.near_bar(m) - cfg["stick_db"],
+                cfg["viable_ms"])
+            if open_strong:
+                g.mismatch_since = 0.0
+                if g.shadow_strong == 0.0:
+                    g.shadow_strong = now
+                if (g.shadow_tier is not None
+                        and (now - g.shadow_strong) * 1000.0
+                            >= cfg.get("shadow_linger_ms", 800)):
+                    log("group '%s': shadow close (tier %s)" % (g.name, g.shadow_tier))
+                    g.shadow_tier = None
+                    shadow_changed = True
+            else:
+                g.shadow_strong = 0.0
+                # Cooldown: no new shadow right after any switch/promote —
+                # without it, inflated bars produced a shadow→promote→shadow
+                # churn loop every ~3 s while the user sat still (2026-10-06).
+                # Estimator fixed too; this is the belt to that braces.
+                if (g.shadow_tier is None
+                        and (now - g.last_switch) * 1000.0
+                            >= cfg.get("shadow_cooldown_ms", 1500)):
+                    cand = None
+                    for p, mics in g.tiers:
+                        if p == g.open_tier:
+                            continue
+                        if self._tier_best(mics, now, cfg["snr_min"],
+                                           cfg["viable_ms"], cred):
+                            cand = p
+                            break
+                    # The MISMATCH STATE (someone else hears you while the
+                    # open mic doesn't catch you strongly) must SUSTAIN
+                    # before the overlap opens: at-desk sentence starts pass
+                    # through it for ~100 ms because the fallback mic's
+                    # evidence matures just before the open mic's "strong"
+                    # does — shadowing on the instant doubled the voice at
+                    # every sentence when both mics were in range
+                    # (2026-10-06). A real walk-away holds the state for as
+                    # long as you're between mics.
+                    if cand is None:
+                        g.mismatch_since = 0.0
+                    elif g.mismatch_since == 0.0:
+                        g.mismatch_since = now
+                    elif (now - g.mismatch_since) * 1000.0 >= cfg.get("shadow_ms", 300):
+                        log("group '%s': shadow open (tier %s)" % (g.name, cand))
+                        g.shadow_tier = cand
+                        g.shadow_since = now
+                        shadow_changed = True
+                elif (g.shadow_tier is not None
+                      and (now - g.shadow_since) * 1000.0
+                          >= cfg.get("shadow_max_ms", 2500)):
+                    # The overlap is a BRIDGE, not a state: its open condition
+                    # (fallback merely viable) is looser than the switch
+                    # condition (fallback near), so sitting in the acoustic
+                    # in-between reached a stable both-mics-open equilibrium —
+                    # permanently doubled voice at the desk (heard live
+                    # 2026-10-06). Past the deadline the transition has had
+                    # every chance: open mic still weak means the shadow has
+                    # PROVEN itself — promote it outright and go single-mic.
+                    log("group '%s': shadow promote (tier %s -> open)"
+                        % (g.name, g.shadow_tier))
+                    if g.open_tier is not None:
+                        g.left_at[g.open_tier] = now
+                    g.open_tier = g.shadow_tier
+                    g.shadow_tier = None
+                    g.pending = None
+                    g.last_switch = now
+                    shadow_changed = True
+
+            def tier_near(p, mics):
+                disc = cfg["stick_db"] if p == g.open_tier else 0.0
+                return self._tier_best(mics, now,
+                                       lambda m: self.near_bar(m) - disc,
+                                       cfg["viable_ms"], cred)
+
+            # Current voice SNR of a tier's best-hearing (credible) mic.
+            def tier_snr(mics):
+                best = 0.0
+                for m in mics:
+                    if cred is not None and not cred(m):
+                        continue
+                    mt = self.meters.get(m)
+                    if mt is None:
+                        continue
+                    with mt.lock:
+                        if (now - mt.last_voiced) <= mt.grace_s:
+                            best = max(best, mt.snr_ewma)
+                return best
+
+            desired = None
+            for p, mics in g.tiers:
+                if tier_near(p, mics):
+                    desired = p
+                    break
+            if desired is None:
+                for p, mics in g.tiers:
+                    if self._tier_best(mics, now, cfg["snr_min"], cfg["viable_ms"], cred):
+                        desired = p
+                        break
+            dom = cfg.get("dominate_db", 8.0)
+            # Priority and dominance MUST agree, with a hysteresis band
+            # between their firing points, or they oscillate: with both mics
+            # in range the priority rule pulled UP to the desk mic while
+            # dominance pulled DOWN to the (slightly better-hearing) headset
+            # — mid-sentence ping-pong, mangled speech (2026-10-06). An
+            # up-move to a near preferred tier is therefore VETOED while the
+            # open tier still hears you dominate_db/2 more clearly; the
+            # down-move needs the full dominate_db. Between the two bands,
+            # whoever is open stays open.
+            # The veto deliberately ignores the voice-run grace window: the
+            # instantaneous SNR reads 0 in every inter-sentence gap, and a
+            # return fired through one such gap put the desk mic on-air
+            # while the user was in another room — 2 s of dead air + a
+            # promote/return oscillation that doubled the voice whenever
+            # they faced away (2026-10-06). snr_ewma persists through
+            # silence and self-corrects on the next heard speech, which is
+            # exactly the memory the veto needs.
+            def tier_snr_held(mics):
+                best = 0.0
+                for m in mics:
+                    mt = self.meters.get(m)
+                    if mt is None:
+                        continue
+                    with mt.lock:
+                        best = max(best, mt.snr_ewma)
+                return best
+
+            # Symmetrically, the up-veto yields to absolute sufficiency: if
+            # you're speaking COMFORTABLY into the preferred mic right now,
+            # you get it back no matter how well the fallback still hears
+            # you — with a worn headset the fallback ALWAYS hears you, and
+            # an unconditional veto would lock you off the desk mic forever.
+            if (desired is not None and g.open_tier is not None
+                    and desired != g.open_tier):
+                prios_ = [p for p, _ in g.tiers]
+                des_mics = g._tier_mics(desired)
+                des_immune = min((self.immune_bar(m) for m in des_mics),
+                                 default=1e9)
+                if (g.open_tier in prios_
+                        and prios_.index(desired) < prios_.index(g.open_tier)
+                        and tier_snr(des_mics) < des_immune
+                        and tier_snr_held(open_true)
+                            >= tier_snr_held(des_mics) + dom / 2.0):
+                    desired = g.open_tier
+            # Dominance: the open tier holding its (stick-discounted) bar is
+            # not enough when another tier hears you FAR more clearly — a desk
+            # mic catching you from across the room still scrapes "near"
+            # while the headset on your head is the obvious right answer.
+            # Highest-priority dominating tier wins. NB: compare against the
+            # TRUE open tier only — open_mics() includes the shadow, which
+            # would otherwise out-vote the very tier it belongs to.
+            # ABSOLUTE SUFFICIENCY RULE: while the open tier hears you
+            # comfortably (near_snr + dominate_immune_db), it is IMMUNE to
+            # dominance — a headset on your head will always beat a desk mic
+            # by 8 dB on a mere lean-back, and "best mic wins" would betray
+            # the priority order constantly ("WAAAY too happy to switch to
+            # arctis", 2026-10-06). Relative comparison is a tie-breaker for
+            # the MARGINAL band only: comfortable -> priority wins outright,
+            # truly weak -> normal down-switch, in between -> dominance may
+            # pull to a far clearer mic (the stalled-walk-away case).
+            immune = min((self.immune_bar(m) for m in open_true), default=1e9)
+            dominated = False
+            if desired == g.open_tier and desired is not None:
+                osnr = tier_snr(open_true)
+                if osnr < immune:
+                    for p, mics in g.tiers:
+                        if p == g.open_tier:
+                            continue
+                        if (tier_snr(mics) >= osnr + dom
+                                and self._tier_best(mics, now, cfg["snr_min"],
+                                                    cfg["viable_ms"], cred)):
+                            desired = p
+                            dominated = True
+                            break
+            if desired is None or desired == g.open_tier:
+                g.pending = None
+                return shadow_changed
+
+            prios = [p for p, _ in g.tiers]
+            oi = prios.index(g.open_tier) if g.open_tier in prios else len(prios)
+            di = prios.index(desired)
+            threshold = cfg["hysteresis_ms"] if di < oi else cfg["drop_ms"]
+            # Anti-flap applies to DOWN moves only: it exists to stop two
+            # borderline-live mics ping-ponging, but "walk out and come right
+            # back" is a normal move and the return UP to the preferred mic
+            # must never be penalised for it (4s returns, traced 2026-10-06).
+            left = g.left_at.get(desired)
+            if (di > oi and left is not None
+                    and (now - left) * 1000.0 < cfg["flap_window_ms"]):
+                threshold = max(threshold, cfg["flap_hold_ms"])
+            # Returns UP to a tier we only just left are cheap to delay —
+            # the fallback mic is CARRYING the voice the whole time — and
+            # expensive to rush: a 200 ms twitch-return put the desk mic
+            # on-air mid promote/return oscillation (2026-10-06). Demand a
+            # sustained case, without the full down-flap penalty.
+            if (di < oi and left is not None
+                    and (now - left) * 1000.0 < cfg["flap_window_ms"]):
+                threshold = max(threshold, cfg.get("return_hold_ms", 800))
+            # A dominance call outranks the slow timers INCLUDING the flap
+            # hold: an 8 dB sustained differential is itself the confirmation,
+            # and every further ms is spent on the mic that's mangling you —
+            # walking away mid-sentence lost whole phrases to the desk mic's
+            # gated/garbled distant pickup (2026-10-06).
+            if dominated:
+                threshold = min(threshold, cfg.get("dominate_ms", 300))
+            if open_dead:
+                threshold = cfg["dead_cut_ms"]
+            if (now - g.last_switch) * 1000.0 < cfg["settle_ms"]:
+                return shadow_changed
+            if g.pending != desired:
+                g.pending = desired
+                g.pending_since = now
+                return shadow_changed
+            if (now - g.pending_since) * 1000.0 < threshold:
+                return shadow_changed
+            if g.open_tier is not None:
+                g.left_at[g.open_tier] = now
+            log("group '%s': tier %s -> %s" % (g.name, g.open_tier, desired))
+            g.open_tier = desired
+            if g.shadow_tier == desired:
+                g.shadow_tier = None   # promoted — it IS the open tier now
+            g.pending = None
+            g.last_switch = now
+            return True
+
+        # ── config / lifecycle ───────────────────────────────────────────
+        def rebuild_groups(self):
+            raw = self.cfg.get("groups") or []
+            old = {g.idx: g for g in self.groups}
+            self.groups = []
+            for i, spec in enumerate(raw):
+                g = old.get(i) or Group(i, "")
+                g.idx = i
+                g.name = spec.get("name") or ("Group %d" % (i + 1))
+                g.enabled = bool(spec.get("enabled", True))
+                g.set_mics(spec.get("mics") or [])
+                if g.all_mics():
+                    self.groups.append(g)
+
+        def apply_state(self):
+            with self.lock:
+                self.cfg = load_config()
+                self.rebuild_groups()
+                en = self.enabled()
+                if en and not self.was_enabled:
+                    # Entering automix: single graph pin + stand the legacy
+                    # switcher down (suspend remembers whether it was on).
+                    subprocess.run([AUTOMIC_MUTATE, "suspend"], timeout=5,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    self.pin_graph()
+                    subprocess.run(["pkill", "-USR1", "-f", "mix-sync-daemon.py"],
+                                   stderr=subprocess.DEVNULL)
+                elif not en and self.was_enabled:
+                    # Leaving automix: open everything back to trims so the
+                    # blend is sane, then hand the filter the preferred mic
+                    # and give the legacy switcher back its say.
+                    for g in self.groups:
+                        g.open_tier = g.tiers[0][0] if g.tiers else None
+                    self.apply_gains(ramp=False)
+                    target = None
+                    present = present_sources()
+                    for g in self.groups:
+                        for m in g.all_mics():
+                            if m in present:
+                                target = m
+                                break
+                        if target:
+                            break
+                    if target:
+                        subprocess.run([SET_INPUT, target], timeout=5)
+                    subprocess.run([AUTOMIC_MUTATE, "resume"], timeout=5,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    subprocess.run(["pkill", "-USR1", "-f", "mix-sync-daemon.py"],
+                                   stderr=subprocess.DEVNULL)
+                self.was_enabled = en
+                self._sync_meters()
+                if en:
+                    self.pin_graph()
+                    self.apply_gains()
+                log("state: enabled=%s groups=%s open=%s"
+                    % (en, [(g.name, g.tiers) for g in self.groups],
+                       [(g.name, g.open_tier) for g in self.groups]))
+
+        # Node add/remove: wrappers/streams may have (dis)appeared — re-gate
+        # everything so a fresh stream never sits open by default, and make
+        # sure the graph pin survived.
+        def _on_node_event(self):
+            with self.lock:
+                if not self.enabled():
+                    return
+                self._sync_meters()
+                self.pin_graph()
+                self.apply_gains(ramp=False)
+
+        def _schedule_verify(self):
+            with self.lock:
+                if self.verify_timer is not None:
+                    self.verify_timer.cancel()
+                self.verify_timer = threading.Timer(0.5, self._on_node_event)
+                self.verify_timer.daemon = True
+                self.verify_timer.start()
+
+        def watch(self):
+            try:
+                proc = subprocess.Popen(["pactl", "subscribe"],
+                                        stdout=subprocess.PIPE, text=True)
+            except Exception as e:
+                log("subscribe failed:", e)
+                return
+            for line in proc.stdout:
+                if "on server" in line:
+                    with self.lock:
+                        if self.enabled():
+                            self.pin_graph()
+                    self._schedule_verify()
+                elif " on source #" in line and ("'new'" in line or "'remove'" in line):
+                    self._schedule_verify()
+                elif " on source-output #" in line and "'change'" in line:
+                    # A blend-stream volume drag: an OPEN mic's new volume is
+                    # its trim. Debounced via the same one-shot timer.
+                    self._schedule_verify()
+
+        def reload_loop(self):
+            while True:
+                self.reload.wait()
+                self.reload.clear()
+                self.apply_state()
+
+        def run(self):
+            ensure_config()
+            log("started; config", CONFIG)
+            self.apply_state()
+            threading.Thread(target=self.reload_loop, daemon=True).start()
+            self._schedule_verify()
+            self.watch()
+
+    def main():
+        ctrl = Controller()
+        signal.signal(signal.SIGHUP, lambda *_: ctrl.reload.set())
+        ctrl.run()
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except KeyboardInterrupt:
+            pass
+  '';
+
+  automix-daemon-sh = pkgs.writeShellScriptBin "audio-automix-daemon" ''
+    # gawk: helpers this daemon execs (audio-list-blend-mics) must find awk
+    # even under the bare systemd user PATH.
+    export PATH="${pkgs.pulseaudio}/bin:${pkgs.pipewire}/bin:${pkgs.procps}/bin:${pkgs.gawk}/bin:$PATH"
+    export AUTOMIX_VAD_METER="${vad-meter-sh}/bin/audio-vad-meter"
+    export AUTOMIX_SET_INPUT="${rnnoise-set-input-sh}/bin/audio-rnnoise-set-input"
+    export AUTOMIX_GET_INPUT="${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input"
+    export AUTOMIX_LIST_BLEND="${list-blend-mics-sh}/bin/audio-list-blend-mics"
+    export AUTOMIX_AUTOMIC_MUTATE="${auto-mic-mutate-sh}/bin/audio-auto-mic-mutate"
+    exec ${pkgs.python3}/bin/python ${automix-daemon-py}
+  '';
+
+  # ── Automix UI backend ──────────────────────────────────────────────────────
+  # Emits:  enabled|<0|1>
+  #         group|<idx>|<0|1 mixed-in>|<name>
+  #         mic|<groupIdx>|<priority>|<node>
+  #         open|<node>              (one per currently-open mic)
+  automix-read-sh = pkgs.writeShellScriptBin "audio-automix-read" ''
+    cfg=${automix-config-path}
+    state="''${XDG_RUNTIME_DIR:-/tmp}/automix-open"
+    if [ -f "$cfg" ]; then
+      ${pkgs.jq}/bin/jq -r '
+        "enabled|" + (if .enabled then "1" else "0" end),
+        ((.groups // []) | to_entries[] |
+          ("group|\(.key)|\(if .value.enabled == false then "0" else "1" end)|\(.value.name // ("Group " + ((.key + 1) | tostring)))"),
+          (.key as $gi | (.value.mics // [])[] |
+            "mic|\($gi)|\(.priority // 1)|\(.node)"))
+      ' "$cfg" 2>/dev/null || echo "enabled|0"
+    else
+      echo "enabled|0"
+    fi
+    [ -f "$state" ] && ${pkgs.gnused}/bin/sed 's/^/open|/' "$state"
+    exit 0
+  '';
+
+  # Mutations. All edits HUP the automix daemon (live apply) and poke the
+  # mix-sync daemon (wrapper/delay policy may change with membership).
+  #   toggle-enabled | set-enabled <1|0>
+  #   group-add                        append empty group
+  #   group-rename <idx> <name>
+  #   group-toggle <idx>               tick/untick the group's mix participation
+  #   group-remove <idx>               (members return to group 0)
+  #   mic-toggle <node> [groupIdx]     add to group (default 0) / remove
+  #   mic-move <node> <groupIdx>       move between groups (keeps priority)
+  #   mic-priority <node> <prio>       set priority (>=1)
+  automix-mutate-sh = pkgs.writeShellScriptBin "audio-automix-mutate" ''
+    cfg=${automix-config-path}
+    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$cfg")"
+    [ -f "$cfg" ] || echo '{"enabled":false,"groups":[{"name":"Group 1","mics":[]}]}' > "$cfg"
+    jq=${pkgs.jq}/bin/jq
+    cmd="$1"; a="$2"; b="$3"
+    tmp=$(${pkgs.coreutils}/bin/mktemp)
+    case "$cmd" in
+      toggle-enabled)
+        "$jq" '.enabled = ((.enabled // false) | not)' "$cfg" > "$tmp" ;;
+      set-enabled)
+        "$jq" --argjson v "$([ "$a" = "1" ] && echo true || echo false)" \
+          '.enabled = $v' "$cfg" > "$tmp" ;;
+      group-add)
+        "$jq" '.groups = ((.groups // []) + [{"name": ("Group " + (((.groups // []) | length) + 1 | tostring)), "mics": []}])' "$cfg" > "$tmp" ;;
+      group-rename)
+        "$jq" --argjson i "$a" --arg n "$b" \
+          '.groups[$i].name = $n' "$cfg" > "$tmp" ;;
+      group-toggle)
+        # Tick/untick a group's mix participation (unticked = fully gated).
+        # NB: jq's // treats false as empty, so `enabled // true` would stick
+        # at false forever — compare explicitly instead.
+        "$jq" --argjson i "$a" \
+          '.groups[$i].enabled = (.groups[$i].enabled == false)' "$cfg" > "$tmp" ;;
+      group-remove)
+        # Members fall back into the first remaining group, so no mic is
+        # silently dropped from the mix by deleting its card.
+        "$jq" --argjson i "$a" '
+          (.groups[$i].mics // []) as $orphans |
+          .groups |= (del(.[$i]) // []) |
+          if (.groups | length) == 0 then .groups = [{"name":"Group 1","mics":[]}] else . end |
+          .groups[0].mics = ((.groups[0].mics // []) + $orphans)
+        ' "$cfg" > "$tmp" ;;
+      mic-toggle)
+        gi="''${b:-0}"
+        "$jq" --arg n "$a" --argjson gi "$gi" '
+          if ([.groups[]?.mics[]? | select(.node == $n)] | length) > 0
+          then .groups |= map(.mics |= map(select(.node != $n)))
+          else .groups[$gi].mics = ((.groups[$gi].mics // []) + [{"node": $n, "priority": 1}])
+          end' "$cfg" > "$tmp" ;;
+      mic-move)
+        "$jq" --arg n "$a" --argjson gi "$b" '
+          ([.groups[]?.mics[]? | select(.node == $n)] | first) as $m |
+          if $m == null then . else
+            .groups |= map(.mics |= map(select(.node != $n))) |
+            .groups[$gi].mics = ((.groups[$gi].mics // []) + [$m])
+          end' "$cfg" > "$tmp" ;;
+      mic-priority)
+        "$jq" --arg n "$a" --argjson p "$b" '
+          .groups |= map(.mics |= map(if .node == $n then .priority = ([$p, 1] | max) else . end))
+        ' "$cfg" > "$tmp" ;;
+      *) ${pkgs.coreutils}/bin/rm -f "$tmp"; echo "unknown command: $cmd" >&2; exit 1 ;;
+    esac
+    if [ -s "$tmp" ]; then ${pkgs.coreutils}/bin/mv "$tmp" "$cfg"; else ${pkgs.coreutils}/bin/rm -f "$tmp"; fi
+    ${pkgs.procps}/bin/pkill -HUP -f automix-daemon.py 2>/dev/null || true
+    ${pkgs.procps}/bin/pkill -USR1 -f mix-sync-daemon.py 2>/dev/null || true
+    echo done
   '';
 
   # ── Cast audio time-sync ────────────────────────────────────────────────────
@@ -2968,6 +4609,113 @@ let
     esac
   '';
 
+  # Classify an output device:  audio-sink-icon-kind [sink-name]
+  # (default sink when no arg). Prints one of:
+  #   net | headphones | headset | hdmi | speaker
+  # "speaker" is also the unknown/fallback class.
+  sink-icon-kind-sh = pkgs.writeShellScriptBin "audio-sink-icon-kind" ''
+    sink="''${1:-$(${pkgs.pulseaudio}/bin/pactl get-default-sink 2>/dev/null)}"
+    case "$sink" in
+      tailnet-out-*) echo net; exit 0 ;;
+    esac
+    ${pkgs.pulseaudio}/bin/pactl list sinks 2>/dev/null | ${pkgs.gawk}/bin/awk -v target="$sink" '
+      function classify(    k, lp, lf, ld) {
+        if (name != target || done) return
+        done = 1
+        k  = "speaker"
+        lp = tolower(port); lf = tolower(ff); ld = tolower(desc)
+        # Form factor / active port beat name heuristics; headset (has a mic)
+        # before headphones so "headset" form factors do not fall through.
+        if      (lf ~ /headset/   || lp ~ /headset/)                 k = "headset"
+        else if (lp ~ /headphone/ || lf ~ /headphone/)               k = "headphones"
+        else if (name ~ /^bluez_/ && ld ~ /head|bud|pods/)           k = "headphones"
+        else if (lp ~ /hdmi|displayport/ || name ~ /hdmi/)           k = "hdmi"
+        print k
+      }
+      /^Sink #/                { classify(); name = ""; desc = ""; port = ""; ff = "" }
+      /^\tName:/               { name = $2 }
+      /^\tDescription:/        { desc = substr($0, index($0, $2)) }
+      /^\tActive Port:/        { port = $3 }
+      /device\.form_factor = / { match($0, /"[^"]*"/); ff = substr($0, RSTART+1, RLENGTH-2) }
+      END { classify(); if (!done) print "speaker" }
+    '
+  '';
+
+  # One-shot feed for the quickshell signal-flow graph. Everything the graph
+  # can't derive from the stores it already has, read LIVE so the drawing can
+  # never go stale against the real chain:
+  #   outchain|<stage>,<stage>,...   filter stages of an applvl slot, in order
+  #   inchain|<stage>,...            filter stages of the mic denoise chain
+  #   aec|<present 0|1>|<on|off>     echo-cancel stage present / engaged
+  #   sinkkind|<name>|<desc>|<kind>  per-sink device class (sink-icon-kind set)
+  #   srckind|<name>|<desc>|<kind>   per-source class: headset|bt|webcam|phone|mic
+  # Stage names come from the chain's Props control names ("<stage>:<control>"),
+  # whose first-seen order follows the filter.graph declaration — control-less
+  # builtins (copy/split) don't surface, which is fine for a flow display.
+  graph-info-sh = pkgs.writeShellScriptBin "audio-graph-info" ''
+    ${pkgs.pipewire}/bin/pw-dump 2>/dev/null | ${pkgs.jq}/bin/jq -r '
+      def stages(nm):
+        [ .[] | select(.info.props."node.name" == nm)
+          | .info.params.Props[]? | select(.params) | .params
+          | .[range(0; length; 2)]
+          | select(type == "string" and contains(":")) | split(":")[0] ]
+        | reduce .[] as $s ([]; if index($s) then . else . + [$s] end);
+      "outchain|" + (stages("applvl.0") | join(",")),
+      "inchain|"  + (stages("capture.rnnoise_source.filter") | join(",")),
+      "aecnode|"  + (if any(.[]; .info.props."node.name"? == "aec_source")
+                     then "1" else "0" end)
+    ' | while IFS='|' read -r tag rest; do
+      if [ "$tag" = "aecnode" ]; then
+        echo "aec|$rest|$(${aec-status-sh}/bin/audio-aec-status)"
+      else
+        echo "$tag|$rest"
+      fi
+    done
+    ${pkgs.pulseaudio}/bin/pactl list sinks 2>/dev/null | ${pkgs.gawk}/bin/awk '
+      function flush(    k, lp, lf, ld) {
+        if (name == "") return
+        k  = "speaker"
+        lp = tolower(port); lf = tolower(ff); ld = tolower(desc)
+        if      (name ~ /^tailnet-out-/)                             k = "net"
+        else if (lf ~ /headset/   || lp ~ /headset/)                 k = "headset"
+        else if (lp ~ /headphone/ || lf ~ /headphone/)               k = "headphones"
+        else if (name ~ /^bluez_/ && ld ~ /head|bud|pods/)           k = "headphones"
+        else if (lp ~ /hdmi|displayport/ || name ~ /hdmi/)           k = "hdmi"
+        print "sinkkind|" name "|" desc "|" k
+      }
+      /^Sink #/                { flush(); name = ""; desc = ""; port = ""; ff = "" }
+      /^\tName:/               { name = $2 }
+      /^\tDescription:/        { desc = substr($0, index($0, $2)) }
+      /^\tActive Port:/        { port = $3 }
+      /device\.form_factor = / { match($0, /"[^"]*"/); ff = substr($0, RSTART+1, RLENGTH-2) }
+      END { flush() }
+    '
+    ${pkgs.pulseaudio}/bin/pactl list sources 2>/dev/null | ${pkgs.gawk}/bin/awk '
+      function flush(    k, lp, lf, ld) {
+        if (name == "" || mon) return
+        # The audio-mix-sync delayed.<mic> wrappers carry no device info of
+        # their own — skip them; lookups strip the prefix and hit the real mic.
+        if (name ~ /^delayed\./) return
+        k  = "mic"
+        lp = tolower(port); lf = tolower(ff); ld = tolower(desc)
+        # "phone" must not swallow "microPHONE" descriptions
+        if      (name ~ /^tailnet-mic-/ || lf ~ /phone/)             k = "phone"
+        else if (lf ~ /headset/ || lp ~ /headset/ || ld ~ /headset/) k = "headset"
+        else if (lf ~ /camera|webcam/ || ld ~ /camera|webcam/)       k = "webcam"
+        else if (name ~ /^bluez_/)                                   k = "bt"
+        print "srckind|" name "|" desc "|" k
+      }
+      /^Source #/              { flush(); name = ""; desc = ""; port = ""; ff = ""; mon = 0 }
+      /^\tName:/               { name = $2 }
+      /^\tDescription:/        { desc = substr($0, index($0, $2)) }
+      /^\tActive Port:/        { port = $3 }
+      /^\tMonitor of Sink:/    { if ($4 != "n/a") mon = 1 }
+      /device\.form_factor = / { match($0, /"[^"]*"/); ff = substr($0, RSTART+1, RLENGTH-2) }
+      END { flush() }
+    '
+    exit 0
+  '';
+
   # ── Per-app OUTPUT balancing (loudness leveler + spike limiter) ─────────────
   # The daemon parks each running app on a free slot of the STATIC filter-chain
   # pool declared in pipewire.nix (applvl.0..N-1) by moving its sink-inputs, and
@@ -2982,6 +4730,8 @@ let
     export PW_CLI=${pkgs.pipewire}/bin/pw-cli
     export PAREC=${pkgs.pulseaudio}/bin/parec
     export MIC_INUSE=${mic-inuse-sh}/bin/audio-mic-inuse
+    export DBUS_MONITOR=${pkgs.dbus}/bin/dbus-monitor
+    export BUSCTL=${pkgs.systemd}/bin/busctl
     exec ${pkgs.python3}/bin/python ${balance-daemon-py} daemon
   '';
 
@@ -3101,6 +4851,15 @@ let
   #   audio-duck mic-level <dB>    → dip depth while the OWN-SPEECH trigger is
   #                                  hot (floors the adaptive/far-end depth;
   #                                  deeper by default — 15 dB).
+  #   audio-duck mic-threshold <dB>
+  #                                → own-speech gate sensitivity, given as dB
+  #                                  below full scale (20-60, default 35 →
+  #                                  -35 dBFS). HIGHER = less sensitive.
+  #   audio-duck margin <dB>       → adaptive headroom: ducked audio sits this
+  #                                  far below the call voices (default 1 —
+  #                                  nearly imperceptible; 6+ is clearly heard).
+  #   audio-duck adaptive [1|0|toggle]
+  #                                → adaptive dip sizing vs fixed duck_db.
   duck-config-path = ''"''${XDG_CONFIG_HOME:-$HOME/.config}/audio-duck/config.json"'';
 
   duck-sh = pkgs.writeShellScriptBin "audio-duck" ''
@@ -3115,11 +4874,12 @@ let
                  "margin|\(.margin_db // 1)",
                  "mic|" + (if (.mic_trigger // false) then "1" else "0" end),
                  "miclevel|\(.mic_duck_db // 15)",
+                 "micthreshold|\((.mic_threshold_db // -35) | -.)",
                  ((.voice_apps // ["vesktop"])[] | "prio|" + ascii_downcase)' \
             "$cfg" 2>/dev/null \
-            || { echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "prio|vesktop"; }
+            || { echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "micthreshold|35"; echo "prio|vesktop"; }
         else
-          echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "prio|vesktop"
+          echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "micthreshold|35"; echo "prio|vesktop"
         fi
         state="''${XDG_STATE_HOME:-$HOME/.local/state}/qs-audio/balance.json"
         { [ -f "$state" ] && jq -r \
@@ -3199,6 +4959,32 @@ let
         tmp=$(mktemp)
         jq --argjson d "$db" '.duck_db = $d | del(.duck_pct)' "$cfg" > "$tmp"
         if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      margin)
+        # Adaptive headroom: ducked audio is sized to sit this many dB below
+        # the call voices. The old 1 dB default made far-end ducking
+        # imperceptible whenever music/games were already quieter than the
+        # voices ("ducking is broken", 2026-10-05) — raise for an audible dip.
+        db="''${2:-}"
+        case "$db" in
+          ""|*[!0-9]*) echo "usage: audio-duck margin <0-20 dB>" >&2; exit 1 ;;
+        esac
+        [ "$db" -gt 20 ] && db=20
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        jq --argjson d "$db" '.margin_db = $d' "$cfg" > "$tmp"
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      adaptive)
+        # adaptive 1|0|toggle — adaptive dip sizing vs the fixed duck_db dip.
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        case "''${2:-toggle}" in
+          1) jq '.adaptive = true'  "$cfg" > "$tmp" ;;
+          0) jq '.adaptive = false' "$cfg" > "$tmp" ;;
+          *) jq '.adaptive = ((.adaptive // true) | not)' "$cfg" > "$tmp" ;;
+        esac
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
       mic-level)
         db="''${2:-}"
         case "$db" in
@@ -3211,8 +4997,21 @@ let
         tmp=$(mktemp)
         jq --argjson d "$db" '.mic_duck_db = $d' "$cfg" > "$tmp"
         if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      mic-threshold)
+        # Stored negative (dBFS); entered positive as "dB below full scale".
+        db="''${2:-}"
+        case "$db" in
+          ""|*[!0-9]*) echo "usage: audio-duck mic-threshold <20-60 dB below full scale>" >&2; exit 1 ;;
+        esac
+        [ "$db" -lt 20 ] && db=20
+        [ "$db" -gt 60 ] && db=60
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        jq --argjson d "$db" '.mic_threshold_db = -$d' "$cfg" > "$tmp"
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
       *)
-        echo "usage: audio-duck [read|toggle|1|0|set-level <dB>|mic [toggle|1|0]|mic-level <dB>|prio <id|key> [toggle|1|0]]" >&2
+        echo "usage: audio-duck [read|toggle|1|0|set-level <dB>|mic [toggle|1|0]|mic-level <dB>|mic-threshold <dB>|prio <id|key> [toggle|1|0]]" >&2
         exit 1 ;;
     esac
     # Nudge the daemon to re-read config + reconcile now (event-driven).
@@ -3393,6 +5192,8 @@ let
     bt-audio-connect-sh
     recency-sh
     default-sink-kind-sh
+    sink-icon-kind-sh
+    graph-info-sh
     list-sinks-sh
     list-sources-sh
     list-sink-inputs-sh
@@ -3428,6 +5229,9 @@ let
     auto-mic-daemon-sh
     auto-mic-read-sh
     auto-mic-mutate-sh
+    automix-daemon-sh
+    automix-read-sh
+    automix-mutate-sh
     mix-sync-daemon-sh
     cast-sync-daemon-sh
     cast-sync-status-sh
@@ -3463,6 +5267,7 @@ rec {
     bt-mic-release-sh
     audio-xrun-guard-sh
     auto-mic-daemon-sh
+    automix-daemon-sh
     aec-auto-daemon-sh
     mix-sync-daemon-sh
     cast-sync-daemon-sh

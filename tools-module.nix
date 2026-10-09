@@ -65,16 +65,21 @@ in
     # physical mic and auto-measures the delays (speech cross-correlation) so
     # MIX mode mixes in-phase. combined_mics captures these wrappers — with
     # this service down, MIX mode has no inputs (single-mic mode unaffected).
+    #
+    # Tied to pipewire.service, NOT graphical-session.target: the mic chain
+    # must work in any session that has PipeWire — an SSH-only boot (greeter
+    # never logged in) left combined_mics with zero capture streams because
+    # graphical-session never activated (2026-10-07). partOf also restarts
+    # the daemon with PipeWire, replacing a dead `pactl subscribe` promptly.
     systemd.user.services.audio-mix-sync = {
       description = "Microphone mix time-alignment (auto-measured delays)";
       after = [
-        "graphical-session.target"
         "pipewire.service"
         "wireplumber.service"
         "pipewire-pulse.service"
       ];
-      partOf = [ "graphical-session.target" ];
-      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "pipewire.service" ];
+      wantedBy = [ "pipewire.service" ];
       unitConfig.StartLimitIntervalSec = 0;
       serviceConfig = {
         ExecStart = "${tools.mix-sync-daemon-sh}/bin/audio-mix-sync-daemon";
@@ -141,14 +146,15 @@ in
     # subscribe.
     systemd.user.services.audio-aec-auto = {
       description = "Echo-cancel auto toggle (speakers on, headphones off)";
+      # pipewire-tied like audio-mix-sync: AEC routing must be right in any
+      # session with PipeWire, not just desktop logins (2026-10-07).
       after = [
-        "graphical-session.target"
         "pipewire.service"
         "wireplumber.service"
         "pipewire-pulse.service"
       ];
-      partOf = [ "graphical-session.target" ];
-      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "pipewire.service" ];
+      wantedBy = [ "pipewire.service" ];
       # If pipewire-pulse isn't up yet `pactl subscribe` fails and the daemon
       # exits; restart unconditionally rather than trip the start limit.
       unitConfig.StartLimitIntervalSec = 0;
@@ -163,14 +169,15 @@ in
     # at ~/.config/auto-mic/config.json enables it with >=2 candidate mics.
     systemd.user.services.auto-mic = {
       description = "Automatic microphone switcher (VAD-driven)";
+      # pipewire-tied like audio-mix-sync: mic selection must work in any
+      # session with PipeWire, not just desktop logins (2026-10-07).
       after = [
-        "graphical-session.target"
         "pipewire.service"
         "wireplumber.service"
         "pipewire-pulse.service"
       ];
-      partOf = [ "graphical-session.target" ];
-      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "pipewire.service" ];
+      wantedBy = [ "pipewire.service" ];
       # If pipewire-pulse isn't up yet, `pactl subscribe` fails and the daemon
       # exits CLEANLY (code 0) — on-failure would leave auto-switch dead for
       # the whole session, so restart unconditionally and never hit the start
@@ -178,6 +185,32 @@ in
       unitConfig.StartLimitIntervalSec = 0;
       serviceConfig = {
         ExecStart = "${tools.auto-mic-daemon-sh}/bin/audio-auto-mic-daemon";
+        Restart = "always";
+        RestartSec = "3s";
+      };
+    };
+
+    # Automix daemon — gain-based successor to the auto-mic switcher (static
+    # graph, per-group priority gating; see automix-daemon-py in tools.nix).
+    # Idle until ~/.config/audio-automix/config.json enables it. Runs
+    # alongside auto-mic during the migration: enabling automix suspends the
+    # legacy switcher (and restores it on disable), so the two never fight.
+    systemd.user.services.audio-automix = {
+      description = "Microphone automix (per-group VAD priority gating)";
+      # pipewire-tied like audio-mix-sync: gain gating must work in any
+      # session with PipeWire, not just desktop logins (2026-10-07).
+      after = [
+        "pipewire.service"
+        "wireplumber.service"
+        "pipewire-pulse.service"
+      ];
+      partOf = [ "pipewire.service" ];
+      wantedBy = [ "pipewire.service" ];
+      # Same rationale as auto-mic: a too-early `pactl subscribe` exits
+      # cleanly, so restart unconditionally with no start limit.
+      unitConfig.StartLimitIntervalSec = 0;
+      serviceConfig = {
+        ExecStart = "${tools.automix-daemon-sh}/bin/audio-automix-daemon";
         Restart = "always";
         RestartSec = "3s";
       };

@@ -29,7 +29,16 @@ the `audio-*` commands, so you can build your own.
     ALSA headroom on real underruns, decays it when quiet. Opt-in via flag
     file (`audio-xrun-guard-toggle`).
   - `auto-mic` — VAD-driven automatic mic switcher, idle until configured
-    (`~/.config/auto-mic/config.json`).
+    (`~/.config/auto-mic/config.json`). LEGACY: superseded by `audio-automix`
+    below (which suspends it while active); kept during the migration.
+  - `audio-automix` — gain-based mic automix (`~/.config/audio-automix/
+    config.json`). The graph stays static (every member mic feeds
+    `combined_mics` → AEC → RNNoise); decisions are volume ramps on the
+    combiner's per-mic streams. Groups mix with each other; within a group,
+    priority tiers gate (1 = preferred, equal priorities = plain blend),
+    driven by the same VAD/echo-guard evidence as auto-mic. mix-sync aligns
+    delays only within a tie-tier, so a solo-priority mic keeps native
+    latency.
 
   Declares `programs.audioctl.enable` (default true) — frontends can gate
   their audio controls on it via home-manager's `osConfig`.

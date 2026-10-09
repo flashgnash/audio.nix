@@ -21,6 +21,13 @@ pipewire-screenaudio:
   #     quickshell audio panel, i.e. under `systemd --user`, which does NOT get
   #     pam_limits — the user@ manager's own ceiling must be raised for its
   #     services (and their children) to go RT.
+  # NB nice MUST be raised alongside rtprio: PipeWire's module-rt renices to
+  # -11 BEFORE taking RT, and when that first setpriority() fails (hard nice
+  # cap 0) it abandons the WHOLE RT setup — rtprio ceiling and all — leaving
+  # every data-loop at plain SCHED_OTHER. Verified live 2026-10-06: rtprio
+  # 95/95 present, data-loops still TS, "could not set nice-level to -11:
+  # Permission denied" in the log; audio crackled whenever a nix build
+  # saturated the CPU.
   security.pam.loginLimits = [
     {
       domain = "@audio";
@@ -28,9 +35,19 @@ pipewire-screenaudio:
       type = "-";
       value = "95";
     }
+    {
+      domain = "@audio";
+      item = "nice";
+      type = "-";
+      value = "-19";
+    }
   ];
   systemd.settings.Manager.DefaultLimitRTPRIO = 95;
-  systemd.user.extraConfig = "DefaultLimitRTPRIO=95";
+  systemd.settings.Manager.DefaultLimitNICE = "-19";
+  systemd.user.extraConfig = ''
+    DefaultLimitRTPRIO=95
+    DefaultLimitNICE=-19
+  '';
 
   services.pulseaudio.enable = false;
 
@@ -50,6 +67,43 @@ pipewire-screenaudio:
     # (flakes/audio/tools-module.nix) returns the card to A2DP once the mic is idle.
     wireplumber.extraConfig."51-bluez-no-headset-autoswitch" = {
       "wireplumber.settings"."bluetooth.autoswitch-to-headset-profile" = false;
+    };
+
+    # USB capture devices get the same xrun armour the sinks already have
+    # (the static sink buffer and the xrun-guard daemon both match
+    # alsa_output.usb-* only). A full-speed USB mic serving as the capture
+    # graph's DRIVER at a small quantum misses its 1-ms-granular isochronous
+    # deadlines, and a driver xrun drops the whole graph's cycle — the mic
+    # chain then delivers fractional-realtime audio (robotic chopped voice to
+    # every consumer). This showed up after a Hyprland crash left the graph
+    # wedged; 512 samples of device-side headroom (~10.6 ms added mic latency)
+    # makes the capture path immune to that jitter regardless of the trigger.
+    wireplumber.extraConfig."53-usb-capture-headroom" = {
+      "monitor.alsa.rules" = [
+        {
+          matches = [ { "node.name" = "~alsa_input\\.usb-.*"; } ];
+          actions.update-props = {
+            "api.alsa.headroom" = 512;
+          };
+        }
+      ];
+    };
+
+    # Bluetooth A2DP source streams (a phone playing INTO this machine): never
+    # let stream-restore resurrect a stale saved volume across reconnects (a
+    # remembered 200% boost = +18 dB of digital clipping on the s16 stream).
+    # The LIVE volume stays writable — the phone's own volume buttons drive it
+    # via AVRCP absolute-volume, so the stream's slider in the mixer tracks
+    # the device; everything further down the chain stays ours.
+    wireplumber.extraConfig."52-bluez-input-no-restore" = {
+      "monitor.bluez.rules" = [
+        {
+          matches = [ { "node.name" = "~bluez_input\\..*"; } ];
+          actions.update-props = {
+            "state.restore-props" = false;
+          };
+        }
+      ];
     };
 
     # Make the RNNoise LADSPA plugin discoverable via PipeWire's LADSPA_PATH.
@@ -133,6 +187,22 @@ pipewire-screenaudio:
               "node.name" = "capture.combined_mics";
               "node.passive" = true;
               "node.async" = true;
+              # NEVER volume-restore these: every per-mic combiner stream
+              # shares this node.name as its restore key, so a PipeWire
+              # restart "restored" the automix daemon's GATED 2% onto the
+              # live mic (speech arrived at -100 dB; whole words vanished,
+              # 2026-10-06). The automix/mix UIs own these volumes at
+              # runtime; a fresh stream must start at unity and wait.
+              "state.restore-props" = false;
+              # ...and NEVER target-restore them either: the same shared key
+              # saved a garbage target during a crash cascade and then
+              # re-applied it on every restart — all combiner streams linked
+              # to rnnoise_source ITSELF (the output feeding the input, the
+              # exact loop the match-rule comment above warns about), chain
+              # starved+looped, survives reboots because the restore DB is
+              # persistent state (2026-10-06). These streams' targets are
+              # defined by stream.rules alone.
+              "state.restore-target" = false;
             };
             "stream.rules" = [
               {
@@ -209,6 +279,11 @@ pipewire-screenaudio:
               "webrtc.gain_control" = false;
               "webrtc.noise_suppression" = false;
               "webrtc.high_pass_filter" = false;
+              # Sink-monitor echo reference carries an unknown (output+room)
+              # delay; these let webrtc converge on it instead of falling back
+              # to aggressive residual suppression.
+              "webrtc.delay_agnostic" = true;
+              "webrtc.extended_filter" = true;
             };
             "capture.props" = {
               "node.name" = "capture.rnnoise_source";
@@ -269,13 +344,102 @@ pipewire-screenaudio:
                     # that capture volume silently sitting at 42% (-22.6 dB) —
                     # starving the VAD of level. If clipping returns, check
                     # `pactl get-source-volume` on the mic before touching these.
-                    # 90 → 95 (2026-08-16): at 90 the fan's voiced-ish buzz kept
+    # 90 → 95 (2026-08-16): at 90 the fan's voiced-ish buzz kept
                     # the gate open through long silences (measured: output
                     # floor -44 dBFS continuous while quiet) and the AGC lifted
                     # it. Speech at proper gain clears 95 comfortably.
-                    "VAD Threshold (%)" = 95.0;
+                    # 95 → 88 (2026-10-06): 95 chopped soft mid-word syllables
+                    # on the (quieter, dynamic) RØDE PodMic ("I am spe—clearly").
+                    # The level gate downstream now owns fan rejection — any
+                    # fan residue the looser VAD passes dies at -45 dBFS — so
+                    # the VAD can afford to favour speech continuity again.
+                    "VAD Threshold (%)" = 88.0;
                     "VAD Grace Period (ms)" = 1200;
                     "Retroactive VAD Grace (ms)" = 100;
+                  };
+                }
+                # Distance-compensating leveler (requested 2026-10-06: leaned
+                # back, the pod is still the better mic but "way quieter").
+                # In-graph, AFTER RNNoise (it levels VOICE, not fan noise),
+                # BEFORE the gate (the gate's auto-fitted threshold must keep
+                # judging a NORMALIZED signal — leveling after it would make
+                # the calibration domain drift with posture). NEVER capture
+                # volumes — that's the Aug-2026 revert; this stage is
+                # invisible to every volume control the user owns.
+                # Slow loop only (quick amplifier off, short gains 0): posture
+                # changes are seconds-scale, and a fast AGC pumps. Silence
+                # level -50 LUFS freezes the gain whenever only RNNoise
+                # residue (-55 dB and below) is present, so gain never winds
+                # up during pauses; the gate downstream still guarantees
+                # digital silence to consumers.
+                {
+                  type = "ladspa";
+                  name = "agc";
+                  plugin = "lsp-plugins-ladspa";
+                  label = "http://lsp-plug.in/plugins/ladspa/autogain_mono";
+                  control = {
+                    "Desired loudness level (LUFS)" = -24.0;
+                    # -45 freeze floor + 8 dB gain cap: at -50/+18 the
+                    # amplified post-RNNoise residue cleared the downstream
+                    # gate, pulsing fan/keyboard noise into a quiet mic.
+                    "The level of silence (LUFS)" = -45.0;
+                    "Level drift (dB)" = 6.0;
+                    "Enable maximum amplification gain limitation" = 1.0;
+                    "The maximum amplification gain (dB)" = 8.0;
+                    "Loudness measuring long period (ms)" = 2000.0;
+                    "Long gain grow amount" = 3.0;
+                    "Long gain fall amount" = 3.0;
+                    "Short gain grow amount" = 0.0;
+                    "Short gain fall amount" = 0.0;
+                    "Enable quick amplifier" = 0.0;
+                    "Weighting function" = 5.0;
+                  };
+                }
+                # Safety limiter: a leveler that may add up to +18 dB needs a
+                # hard ceiling so a sudden close shout can't clip (-1 dBFS,
+                # same idiom as the applvl output chains).
+                {
+                  type = "ladspa";
+                  name = "lim";
+                  plugin = "lsp-plugins-ladspa";
+                  label = "http://lsp-plug.in/plugins/ladspa/limiter_mono";
+                  control = {
+                    # -1 dBFS ceiling: 10^(-1/20)
+                    "Threshold (G)" = 0.891;
+                    "Lookahead (ms)" = 5.0;
+                  };
+                }
+                # Level gate AFTER RNNoise: the VAD gate alone chains open on
+                # loud fans (each false VAD hit buys another grace period —
+                # measured 15+ s of -55..-75 dBFS mangled-fan residue after
+                # speech, audible via any downstream AGC/monitor, 2026-10-06).
+                # Real speech leaves RNNoise 20+ dB above this threshold, the
+                # fan residue sits 10-30 dB below it, so the gate is
+                # deterministic: zero attack (word onsets never clip — the
+                # VAD's retroactive grace already feeds the start through),
+                # 300 ms release + hold bridges inter-word dips, and the
+                # -72 dB floor means sustained silence is DIGITALLY silent to
+                # every consumer. Wet path only — the dry bypass stays raw.
+                {
+                  type = "ladspa";
+                  name = "gate";
+                  plugin = "lsp-plugins-ladspa";
+                  label = "http://lsp-plug.in/plugins/ladspa/gate_mono";
+                  control = {
+                    # Cold-boot SEED only — the automix daemon's gate autofit
+                    # re-derives the threshold from the user's measured speech
+                    # level within seconds of talking (speech − 25 dB; it
+                    # landed at −58.6 here). The seed errs GENTLE (-55 dB): a
+                    # too-hot seed chopped soft syllables for the first ~20 s
+                    # after every PipeWire restart until autofit converged
+                    # (2026-10-06); a too-soft one merely risks faint fan
+                    # residue for the same window.  -55 dBFS = 10^(-55/20)
+                    "Curve threshold (G)" = 0.00178;
+                    "Attack (ms)" = 0.0;
+                    "Release (ms)" = 300.0;
+                    "Hold time (ms)" = 200.0;
+                    # fully closed = -72 dB (port minimum)
+                    "Reduction (G)" = 0.00025119;
                   };
                 }
                 {
@@ -300,6 +464,18 @@ pipewire-screenaudio:
                 }
                 {
                   output = "rnnoise:Output";
+                  input = "agc:Input";
+                }
+                {
+                  output = "agc:Output";
+                  input = "lim:Input";
+                }
+                {
+                  output = "lim:Output";
+                  input = "gate:Input";
+                }
+                {
+                  output = "gate:Output";
                   input = "mix:In 2";
                 }
               ];
