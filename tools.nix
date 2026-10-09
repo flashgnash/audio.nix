@@ -800,39 +800,35 @@ let
   # respected as the new baseline, and every change it makes shows up on the
   # slider. pw-top only receives profiler data while the graph is actually
   # processing, so the daemon is effectively free when no audio plays.
+  # OUTPUT only. CAPTURE xruns are handled structurally by keeping the mic out
+  # of the driver role (priority.driver in pipewire.nix) — as a follower it
+  # absorbs its own jitter and can't storm the graph, so there is nothing for
+  # a reactive guard to do on the capture side (and headroom doesn't fix a
+  # capture-driver storm anyway — verified 2026-10-09).
   audio-xrun-guard-sh = pkgs.writeShellScriptBin "audio-xrun-guard" ''
-    # OUTPUT sinks boot at headroom 0 (rhythm games want minimum latency) and
-    # the slider shares this statefile. CAPTURE devices boot at the
-    # wireplumber base (53-usb-capture-headroom = 512) and have NO slider, so
-    # the guard escalates above that floor and decays back DOWN to it, never
-    # below — a full-speed USB mic (PodMic) that the guard previously ignored
-    # entirely is now covered too (2026-10-09).
-    out_state="$XDG_RUNTIME_DIR/qs-usb-headroom"
-    cap_state="$XDG_RUNTIME_DIR/qs-usb-capture-headroom"
-    CAP_FLOOR=512   # keep in sync with 53-usb-capture-headroom in pipewire.nix
+    state="$XDG_RUNTIME_DIR/qs-usb-headroom"
 
-    # read a statefile with a default when empty/corrupt: read_state FILE DEFAULT
-    read_state() {
-      c=$(cat "$1" 2>/dev/null)
-      case "$c" in "" | *[!0-9]*) echo "$2" ;; *) echo "$c" ;; esac
+    cur() {
+      c=$(cat "$state" 2>/dev/null)
+      case "$c" in "" | *[!0-9]*) echo 0 ;; *) echo "$c" ;; esac
     }
 
-    # apply_nodes PREFIX SAMPLES STATEFILE
-    apply_nodes() {
+    apply() {
       ${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
-        | ${pkgs.jq}/bin/jq --arg p "$1" '.[] | select((.info.props["node.name"] // "") | startswith($p)) | .id' \
+        | ${pkgs.jq}/bin/jq '.[] | select((.info.props["node.name"] // "") | startswith("alsa_output.usb-")) | .id' \
         | while read -r id; do
             ${pkgs.pipewire}/bin/pw-cli set-param "$id" Props \
-              "{ params = [ \"api.alsa.headroom\" $2 ] }" >/dev/null 2>&1 || true
+              "{ params = [ \"api.alsa.headroom\" $1 ] }" >/dev/null 2>&1 || true
           done
-      printf '%s\n' "$2" > "$3"
+      printf '%s\n' "$1" > "$state"
     }
 
-    # awk emits "o" when a USB SINK's ERR rises, "i" when a USB SOURCE's does.
-    # The ERR column index is read from pw-top's own header (layout varies by
-    # version — this one splits W/Q and B/Q so ERR is field 9; a hard-coded
-    # field 8 caught the load ratio and fired constantly). read -t turns 5
-    # xrun-free minutes into a decay step.
+    # awk emits a line whenever a USB sink's ERR (xrun) count increases; the
+    # column index is taken from pw-top's own header line rather than
+    # hard-coded, because the layout varies between pipewire versions (this
+    # one has W/Q and B/Q as separate columns, so ERR is field 9 — reading a
+    # fixed field 8 picked up the per-cycle load ratio and fired constantly).
+    # read -t turns 5 xrun-free minutes into a decay step.
     ${pkgs.pipewire}/bin/pw-top -b 2>/dev/null \
       | ${pkgs.gawk}/bin/awk '
           $1 == "S" && $2 == "ID" {
@@ -840,44 +836,27 @@ let
             next
           }
           erridx && $NF ~ /^alsa_output\.usb-/ {
-            if ($NF in last && $erridx > last[$NF]) { print "o"; fflush() }
-            last[$NF] = $erridx
-          }
-          erridx && $NF ~ /^alsa_input\.usb-/ {
-            if ($NF in last && $erridx > last[$NF]) { print "i"; fflush() }
+            if ($NF in last && $erridx > last[$NF]) { print "x"; fflush() }
             last[$NF] = $erridx
           }' \
       | {
-        last_o=0
-        last_i=0
+        last_bump=0
         while :; do
           ret=0
-          read -r -t 300 tag || ret=$?
+          read -r -t 300 _ || ret=$?
           if [ "$ret" -eq 0 ]; then
             now=$(date +%s)
-            case "$tag" in
-              o)
-                [ $((now - last_o)) -lt 5 ] && continue
-                last_o=$now
-                c=$(read_state "$out_state" 0)
-                if [ "$c" -lt 256 ]; then apply_nodes "alsa_output.usb-" 256 "$out_state"
-                elif [ "$c" -lt 2048 ]; then apply_nodes "alsa_output.usb-" $((c * 2)) "$out_state"
-                fi ;;
-              i)
-                [ $((now - last_i)) -lt 5 ] && continue
-                last_i=$now
-                c=$(read_state "$cap_state" "$CAP_FLOOR")
-                if [ "$c" -lt 2048 ]; then
-                  n=$((c * 2)); [ "$n" -lt "$CAP_FLOOR" ] && n=$CAP_FLOOR
-                  apply_nodes "alsa_input.usb-" "$n" "$cap_state"
-                fi ;;
-            esac
+            [ $((now - last_bump)) -lt 5 ] && continue
+            last_bump=$now
+            c=$(cur)
+            if [ "$c" -lt 256 ]; then apply 256
+            elif [ "$c" -lt 2048 ]; then apply $((c * 2))
+            fi
           elif [ "$ret" -gt 128 ]; then
-            # 5 quiet minutes — decay both toward their floors (out:0, cap:512)
-            c=$(read_state "$out_state" 0)
-            if [ "$c" -gt 0 ]; then n=$((c / 2)); [ "$n" -lt 256 ] && n=0; apply_nodes "alsa_output.usb-" "$n" "$out_state"; fi
-            c=$(read_state "$cap_state" "$CAP_FLOOR")
-            if [ "$c" -gt "$CAP_FLOOR" ]; then n=$((c / 2)); [ "$n" -lt "$CAP_FLOOR" ] && n=$CAP_FLOOR; apply_nodes "alsa_input.usb-" "$n" "$cap_state"; fi
+            c=$(cur)
+            [ "$c" -eq 0 ] && continue
+            n=$((c / 2)); [ "$n" -lt 256 ] && n=0
+            apply "$n"
           else
             break     # pw-top went away (pipewire restart) — service restarts us
           fi

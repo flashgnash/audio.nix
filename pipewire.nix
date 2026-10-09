@@ -69,21 +69,28 @@ pipewire-screenaudio:
       "wireplumber.settings"."bluetooth.autoswitch-to-headset-profile" = false;
     };
 
-    # USB capture devices get the same xrun armour the sinks already have
-    # (the static sink buffer and the xrun-guard daemon both match
-    # alsa_output.usb-* only). A full-speed USB mic serving as the capture
-    # graph's DRIVER at a small quantum misses its 1-ms-granular isochronous
-    # deadlines, and a driver xrun drops the whole graph's cycle — the mic
-    # chain then delivers fractional-realtime audio (robotic chopped voice to
-    # every consumer). This showed up after a Hyprland crash left the graph
-    # wedged; 512 samples of device-side headroom (~10.6 ms added mic latency)
-    # makes the capture path immune to that jitter regardless of the trigger.
+    # Keep USB capture devices OUT of the graph-driver role. A full-speed USB
+    # mic (PodMic) defaults to priority.driver 2100 — ABOVE every output sink
+    # (~1108) — so the ENTIRE graph clocks off it. Full-speed USB has only
+    # 1 ms of isochronous timing granularity, so under load (a build, a game,
+    # a Hyprland-crash recovery spike) it misses cycle deadlines, and a DRIVER
+    # xrun drops the whole graph's cycle → fractional-realtime "robot" audio
+    # to every consumer. Headroom does NOT fix a driver storm (verified: 2048
+    # samples, still storming); only forcing the whole graph to a huge quantum
+    # did, at the cost of output latency. Demoting the mic below the sinks
+    # makes a RUNNING sink drive instead; the mic becomes a follower that
+    # absorbs its own clock jitter via adaptive resampling — verified storm-
+    # free at quantum 256 under load average 22 (2026-10-09). The 512-sample
+    # headroom stays as cheap follower-side insurance.
     wireplumber.extraConfig."53-usb-capture-headroom" = {
       "monitor.alsa.rules" = [
         {
           matches = [ { "node.name" = "~alsa_input\\.usb-.*"; } ];
           actions.update-props = {
             "api.alsa.headroom" = 512;
+            # below the sinks (~1108) so an active sink wins the driver role;
+            # the mic still drives as a last resort if no sink is running.
+            "priority.driver" = 100;
           };
         }
       ];
