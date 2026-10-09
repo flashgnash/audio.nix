@@ -29,13 +29,28 @@ in
     # it) and ConditionPathExists makes the choice persist across logins.
     systemd.user.services.audio-xrun-guard = {
       description = "USB audio xrun guard (auto headroom)";
-      after = [ "graphical-session.target" ];
-      partOf = [ "graphical-session.target" ];
-      wantedBy = [ "graphical-session.target" ];
-      unitConfig.ConditionPathExists = "!%E/qs-audio-xrun-guard-disabled";
+      # pipewire-tied, NOT graphical-session: the guard's pw-top pipeline ENDS
+      # whenever pipewire restarts and the script exits 0 BY DESIGN, expecting
+      # systemd to restart it. With Restart=on-failure (clean exit = no
+      # restart) under graphical-session it stayed DEAD after the first
+      # pipewire restart / rb of a session — "auto headroom" silently off for
+      # the rest of the session, so it "barely ever worked" (2026-10-09).
+      # Restart=always + pipewire binding make it come back every time.
+      after = [
+        "pipewire.service"
+        "wireplumber.service"
+        "pipewire-pulse.service"
+      ];
+      partOf = [ "pipewire.service" ];
+      wantedBy = [ "pipewire.service" ];
+      unitConfig = {
+        ConditionPathExists = "!%E/qs-audio-xrun-guard-disabled";
+        # The restart-on-pipewire-bounce loop must not trip the start limit.
+        StartLimitIntervalSec = 0;
+      };
       serviceConfig = {
         ExecStart = "${tools.audio-xrun-guard-sh}/bin/audio-xrun-guard";
-        Restart = "on-failure";
+        Restart = "always";
         RestartSec = "2s";
       };
     };
