@@ -642,10 +642,12 @@ let
     want="$1"   # "on" or "off"
     case "$want" in on|off) ;; *) echo "usage: audio-aec-set on|off" >&2; exit 1 ;; esac
     statefile="$XDG_RUNTIME_DIR/qs-aec-on"
-    innerid=$(${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
+    # Best-effort id for the target.object metadata hint (pw-dump can stall
+    # on a complex graph; a timeout keeps the toggle responsive). Linking
+    # below works off node NAMES, so a missing id only skips the WP hint.
+    innerid=$(timeout 8 ${pkgs.pipewire}/bin/pw-dump 2>/dev/null \
       | ${pkgs.jq}/bin/jq -r '.[] | select(.info.props["node.name"] == "capture.rnnoise_source.filter") | .id' \
       | head -1)
-    [ -z "$innerid" ] && { echo "no capture.rnnoise_source.filter"; exit 1; }
     if [ "$want" = "on" ]; then
       tgt="aec_source"
     else
@@ -655,7 +657,8 @@ let
       tgt=$(${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input)
       [ -z "$tgt" ] && { echo "cannot resolve current mic"; exit 1; }
     fi
-    ${pkgs.pipewire}/bin/pw-metadata "$innerid" target.object "$tgt" >/dev/null 2>&1
+    [ -n "$innerid" ] && ${pkgs.pipewire}/bin/pw-metadata "$innerid" target.object "$tgt" >/dev/null 2>&1
+    # Sweep any link that ISN'T the intended feed.
     ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | ${pkgs.gawk}/bin/awk -v want="$tgt" '
       /^capture\.rnnoise_source\.filter:input_MONO/ { f = 1; next }
       f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); print s }
@@ -666,6 +669,21 @@ let
         *) ${pkgs.pipewire}/bin/pw-link -d "$srcport" "capture.rnnoise_source.filter:input_MONO" 2>/dev/null ;;
       esac
     done
+    # GUARANTEE the intended link exists rather than trusting target.object.
+    # WirePlumber's metadata-driven reconnect RACES at graph (re)build: on a
+    # cold pipewire start aec_source may not exist yet when the filter is
+    # placed, and an AEC toggle can leave the input orphaned — a dead-silent
+    # mic that survives until something relinks it (cost whole calls over
+    # 2026-10-09). pw-link by name is idempotent, so re-asserting is safe.
+    have=$(${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | ${pkgs.gawk}/bin/awk -v t="$tgt" '
+      /^capture\.rnnoise_source\.filter:input_MONO/ { f = 1; next }
+      f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); if (index(s, t ":") == 1) h = 1 }
+      f && /^[^[:space:]]/ { f = 0 }
+      END { print h + 0 }')
+    if [ "$have" != 1 ]; then
+      srcport=$(${pkgs.pipewire}/bin/pw-link -o 2>/dev/null | ${pkgs.gnugrep}/bin/grep -m1 "^$tgt:")
+      [ -n "$srcport" ] && ${pkgs.pipewire}/bin/pw-link "$srcport" "capture.rnnoise_source.filter:input_MONO" 2>/dev/null
+    fi
     printf '%s\n' "$want" > "$statefile"
     echo done
   '';
@@ -703,6 +721,26 @@ let
       } | ${pkgs.gnugrep}/bin/grep -qiE 'headphone|headset|bluez' \
         && echo headphones || echo speaker
     }
+    # Cheap check (pw-link only): is the filter input already wired to the
+    # feed the CURRENT AEC state implies? Lets source events repair an
+    # orphaned link without the cost of re-classifying the output.
+    link_ok() {
+      if [ "$(${aec-status-sh}/bin/audio-aec-status)" = on ]; then
+        t=aec_source
+      else
+        t=$(${rnnoise-current-input-sh}/bin/audio-rnnoise-current-input)
+      fi
+      [ -z "$t" ] && return 0   # can't resolve — don't thrash
+      ${pkgs.pipewire}/bin/pw-link -l 2>/dev/null | ${pkgs.gawk}/bin/awk -v t="$t" '
+        /^capture\.rnnoise_source\.filter:input_MONO/ { f = 1; next }
+        f && /\|<-/ { s = $0; sub(/.*\|<-[ ]*/, "", s); if (index(s, t ":") == 1) ok = 1 }
+        f && /^[^[:space:]]/ { f = 0 }
+        END { exit !ok }'
+    }
+    # Re-establish the link for the current state without re-classifying.
+    repair_link() {
+      link_ok || ${aec-set-sh}/bin/audio-aec-set "$(${aec-status-sh}/bin/audio-aec-status)"
+    }
     evaluate() {
       case "$(classify)" in
         speaker) want=on ;;
@@ -710,13 +748,21 @@ let
         *) return 0 ;;   # no default sink yet — leave as-is
       esac
       cur=$(${aec-status-sh}/bin/audio-aec-status)
-      [ "$cur" = "$want" ] && return 0
-      ${aec-set-sh}/bin/audio-aec-set "$want"
+      # Re-assert when the desired STATE changed OR the link drifted/orphaned.
+      # A graph rebuild (pipewire restart) or an AEC toggle can leave the
+      # filter input unlinked even though the state is nominally right — a
+      # dead-silent mic (2026-10-09). audio-aec-set re-creates the link.
+      if [ "$cur" != "$want" ] || ! link_ok; then
+        ${aec-set-sh}/bin/audio-aec-set "$want"
+      fi
     }
     evaluate
     ${pkgs.pulseaudio}/bin/pactl subscribe | while IFS= read -r line; do
       case "$line" in
         *" on server"*|*" on sink"*|*" on card"*) evaluate ;;
+        # aec_source (re)appearing after a graph rebuild is a SOURCE event;
+        # repair the link without the full re-classify on this hot path.
+        *" on source"*) repair_link ;;
       esac
     done
   '';
