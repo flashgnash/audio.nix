@@ -3631,14 +3631,28 @@ let
                 with open(GATE) as f:
                     g = json.load(f)
                 s = g.get("speech_db"); n = g.get("noise_db")
-                if isinstance(s, (int, float)) and -80.0 <= s <= 0.0:
+                if self._gate_pair_sane(s, n):
                     self.speech_db = float(s)
-                if isinstance(n, (int, float)) and -90.0 <= n <= 0.0:
                     self.noise_db = float(n)
             except Exception:
                 pass
 
+        # A persisted calibration is only trustworthy if speech sits CLEARLY
+        # above noise. An inverted or near-equal pair (e.g. speech -45 /
+        # noise -41) is poison from a storm/echo episode where the chain
+        # output was garbage and got banked as "speech"/"noise" — loading it
+        # boots the gate INTO the user's own speech and chops every word
+        # (2026-10-09). Reject such pairs (relearn from scratch) and never
+        # persist them in the first place.
+        @staticmethod
+        def _gate_pair_sane(s, n):
+            return (isinstance(s, (int, float)) and isinstance(n, (int, float))
+                    and -70.0 <= s <= -5.0 and -90.0 <= n <= -30.0
+                    and s - n >= 6.0)
+
         def save_gate(self):
+            if not self._gate_pair_sane(self.speech_db, self.noise_db):
+                return
             try:
                 os.makedirs(os.path.dirname(GATE), exist_ok=True)
                 tmp = GATE + ".tmp"
