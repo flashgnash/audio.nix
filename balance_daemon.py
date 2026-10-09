@@ -1163,6 +1163,12 @@ def _atomic_write(obj):
 # ------------------------------------------------------------------- reconcile
 # slot node.name -> app key currently assigned to it (in-memory, authoritative)
 _assign = {}
+# stream id -> the real output device ("home") it was headed to before we pulled
+# it onto a leveler slot. Each slot's .out bridge is routed back to its stream's
+# home, so balancing keeps a stream on the device it was meant for (per-device)
+# rather than funnelling every levelled stream onto the default. Streams whose
+# home is the default (the usual case) are left to follow the default as before.
+_home = {}
 _recon_lock = threading.Lock()
 _last_published = None
 _publish_lock = threading.Lock()
@@ -1175,6 +1181,21 @@ _input_rows = []
 
 def _move(stream_id, sink_name):
     sh(PACTL, "move-sink-input", stream_id, sink_name)
+
+
+def _is_real_output(name):
+    """A sink audio actually comes OUT of — a physical/aggregate device — not one
+    of our own routing/plumbing sinks (leveler slots, fx chains, per-user or cast
+    null-sinks, the MIX aggregate, or any '.out' bridge). Used to learn a balanced
+    stream's home device (see _home)."""
+    if not name:
+        return False
+    if name in SLOT_SINKS or name in FX_SINKS:
+        return False
+    if name.endswith(".out"):
+        return False
+    return not name.startswith(
+        ("applvl.", "strmfx.", "castaudio_", "discord_user_", "combined_"))
 
 
 # ---- post-leveler per-app offset -------------------------------------------
@@ -1478,6 +1499,7 @@ def _disable_cleanup():
     _assign.clear()
     _slot_stream.clear()
     _fx_streams.clear()
+    _home.clear()
     _duck_sync_chains(set())
     _set_output_rows([])
 
@@ -1554,12 +1576,28 @@ def _reconcile_locked():
         # sits on a real output and flows through here normally.
         if cur_sink.startswith("discord_user_"):
             continue
+        # A stream the per-player cast button routed onto a cast null-sink
+        # (castaudio_<device>, created by castAudio) is pinned there to cast
+        # JUST that player — exactly like the per-user case above. Leaving it
+        # be is what makes per-stream casting work: otherwise the slot
+        # reconcile below yanks it straight back onto its applvl.<n> leveler,
+        # emptying the cast sink (silence on the device). castAudio tears the
+        # sink down when the cast ends, so the stream rejoins the pool on its
+        # own — no explicit un-pin needed here.
+        if cur_sink.startswith("castaudio_"):
+            continue
         streams_by_id[si["id"]] = si
 
     with _slot_gain_lock:
         gains = dict(_slot_gain)
         gains_db = dict(_slot_gain_db)
     out_ids = _applvl_out_ids()
+    # Current sink of EVERY sink-input (incl. the .out bridges) + the set of live
+    # sink names — used to route each slot's .out bridge to its stream's home
+    # device (per-device balancing) without churn.
+    live_sinks = set(sink_name.values())
+    si_cur_sink = {si["id"]: sink_name.get(si.get("sink_index", ""), "")
+                   for si in streams}
     trims_dirty = False
 
     # Ducking: detectors follow the voice streams; capture the duck state once
@@ -1658,6 +1696,7 @@ def _reconcile_locked():
                 _set_out_vol(slot, 100, out_ids)
             _assign.clear()
             _slot_stream.clear()
+            _home.clear()
         if trims_dirty:
             _save_trims()
         _set_voice_chains(voice_chains)
@@ -1746,7 +1785,24 @@ def _reconcile_locked():
             continue
         cur = sink_name.get(si.get("sink_index", ""), "")
         if cur != slot:
+            # Learn the stream's home device the moment before we pull it onto the
+            # slot — but only a REAL output, never our own plumbing sinks. A stream
+            # already sitting on its slot keeps whatever home we last recorded.
+            if _is_real_output(cur):
+                _home[sid] = cur
             _move(si["id"], slot)
+        # Route this slot's levelled-output bridge to the stream's home device.
+        # home == default (the usual case) or unknown -> send it to the default,
+        # which is exactly the old global behaviour and keeps following default /
+        # MIX (combined_out) changes. A specific NON-default home pins the bridge
+        # there, so a stream balanced while playing on a second output stays on
+        # THAT device instead of being dumped on the default — per-device balance.
+        if dflt:
+            _out_id = out_ids.get(slot)
+            _h = _home.get(sid)
+            _want = _h if (_h and _h != dflt and _h in live_sinks) else dflt
+            if _out_id and si_cur_sink.get(_out_id, "") != _want:
+                _move(_out_id, _want)
         key = app_key(si)
         is_voice = _is_voice_stream(si)
         if not is_voice:
@@ -1799,6 +1855,11 @@ def _reconcile_locked():
     for slot in list(_slot_stream.keys()):
         if slot not in _assign:
             _slot_stream.pop(slot, None)
+    # Forget home-device memory for streams no longer balanced.
+    _assigned_sids = set(_assign.values())
+    for sid in list(_home.keys()):
+        if sid not in _assigned_sids:
+            _home.pop(sid, None)
     _set_voice_chains(voice_chains)
     _duck_sync_chains(duck_chains)
     # Streams no chain covers (pool overflow) still dip their own volume.
