@@ -88,9 +88,14 @@ pipewire-screenaudio:
           matches = [ { "node.name" = "~alsa_input\\.usb-.*"; } ];
           actions.update-props = {
             "api.alsa.headroom" = 512;
-            # below the sinks (~1108) so an active sink wins the driver role;
-            # the mic still drives as a last resort if no sink is running.
-            "priority.driver" = 100;
+            # NOTE: demoting USB capture from the driver role (priority.driver
+            # 100) DID stop the load storms (mic becomes a follower), but it
+            # fragmented the clock domains — the mic chain ran at a different
+            # quantum than the sink/echo-reference, so the WebRTC AEC could no
+            # longer time-align and FAILED on speakers (echo leaked + its
+            # residual suppressor ate whole words). Reverted 2026-10-09. The
+            # correct fix keeps the mic a follower of THE SAME driver as the
+            # echo reference (one clock domain) — a follow-up.
           };
         }
       ];
