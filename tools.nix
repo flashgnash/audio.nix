@@ -3201,6 +3201,9 @@ let
     ENVS = os.path.join(
         os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
         "audio-automix", "envelopes.json")
+    GATE = os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "audio-automix", "gate.json")
     STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "automix-open")
     VAD_METER = os.environ.get("AUTOMIX_VAD_METER") or "qs-vad-meter"
     SET_INPUT = os.environ.get("AUTOMIX_SET_INPUT") or "qs-rnnoise-set-input"
@@ -3574,6 +3577,7 @@ let
             self.speech_db = None    # tracked speech level at the chain output
             self.noise_db = None     # tracked residue/leak ceiling at the output
             self.gate_db = None      # last gate threshold we applied
+            self.gate_dirty = 0.0    # last unsaved speech/noise change (0 = clean)
             self.bleed = {}          # mic -> learned playback-bleed SNR
             self.bleed_n = {}        # mic -> sample count (gates credibility)
             self.bleed_dirty = 0.0   # last unsaved-change time (0 = clean)
@@ -3611,6 +3615,35 @@ let
                 self.env_n = {k: int(v[1]) for k, v in raw.items()}
             except Exception:
                 self.env, self.env_n = {}, {}
+            # Gate calibration (speech/noise level): without this the daemon
+            # boots with speech_db None and must RE-LEARN from scratch after
+            # every reboot/rebuild — a warm-up window where the user is
+            # inaudible until they have spoken enough to converge. The levels
+            # are a property of the mic + room + gain, stable across restarts;
+            # a stale value is a fine starting estimate the EWMA refines.
+            # Sanity-bounded so a corrupt file can't seed an absurd gate.
+            try:
+                with open(GATE) as f:
+                    g = json.load(f)
+                s = g.get("speech_db"); n = g.get("noise_db")
+                if isinstance(s, (int, float)) and -80.0 <= s <= 0.0:
+                    self.speech_db = float(s)
+                if isinstance(n, (int, float)) and -90.0 <= n <= 0.0:
+                    self.noise_db = float(n)
+            except Exception:
+                pass
+
+        def save_gate(self):
+            try:
+                os.makedirs(os.path.dirname(GATE), exist_ok=True)
+                tmp = GATE + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump({"speech_db": self.speech_db,
+                               "noise_db": self.noise_db}, f, indent=2)
+                os.replace(tmp, GATE)
+                self.gate_dirty = 0.0
+            except Exception as e:
+                log("gate save failed:", e)
 
         def save_envs(self):
             try:
@@ -3941,6 +3974,8 @@ let
                         # follows the user's level, never chases silence.
                         self.speech_db = db if self.speech_db is None else (
                             0.98 * self.speech_db + 0.02 * db)
+                        if self.gate_dirty == 0.0:
+                            self.gate_dirty = now
                 elif since_voiced > 5.0:
                     # NON-voiced audio LONG after any speech = gate leakage
                     # (fan residue clearing the current threshold). Track its
@@ -3951,13 +3986,38 @@ let
                     # walk-away railed the threshold to 2.6 dB below the
                     # user's own voice (2026-10-06). Real speech always has
                     # voiced windows nearby; true fan residue has none.
-                    if self.noise_db is None:
-                        self.noise_db = db
-                    elif db > self.noise_db:
-                        self.noise_db = 0.7 * self.noise_db + 0.3 * db
-                    else:
-                        self.noise_db = 0.995 * self.noise_db + 0.005 * db
-            if not voiced or self.speech_db is None:
+                    #
+                    # EXCEPT while media plays: speaker audio leaves AEC
+                    # RESIDUAL on the chain output that is ALSO non-voiced and
+                    # 5 s past speech — indistinguishable here from fan hiss.
+                    # A YouTube video banked its residual as the noise floor,
+                    # lifted the gate ~6 dB and hard-clipped the user's own
+                    # speech afterwards (2026-10-09). Skip the noise update
+                    # while the playback reference is (recently) live.
+                    play_recent = False
+                    if self.ref_meter is not None:
+                        with self.ref_meter.lock:
+                            play_recent = (now - self.ref_meter.last_voiced) <= (
+                                self.ref_meter.grace_s
+                                + float(self.cfg.get("echo_clear_ms", 400)) / 1000.0)
+                    if not play_recent:
+                        if self.noise_db is None:
+                            self.noise_db = db
+                        elif db > self.noise_db:
+                            self.noise_db = 0.7 * self.noise_db + 0.3 * db
+                        else:
+                            self.noise_db = 0.995 * self.noise_db + 0.005 * db
+                        if self.gate_dirty == 0.0:
+                            self.gate_dirty = now
+            # Persist the calibration ~60 s after it last changed, so a
+            # reboot/rebuild resumes from it instead of an inaudible warm-up.
+            if self.gate_dirty and (now - self.gate_dirty) > 60.0:
+                self.save_gate()
+            # Apply even when NOT currently voiced: lets the calibration LOADED
+            # at startup take effect before the first word (no warm-up) and the
+            # gate track a moving noise floor during pauses. Learning above
+            # still requires voiced speech, so silence never moves the levels.
+            if self.speech_db is None:
                 return
             if (now - self.gate_at) < 5.0:
                 return
