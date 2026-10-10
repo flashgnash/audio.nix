@@ -47,6 +47,12 @@ resuming mid-release turns the slide around from wherever it is). Config
 lives at ~/.config/audio-duck/config.json (audio-duck CLI, tools.nix);
 priority (duck-triggering) apps are its voice_apps list.
 
+The muffle gate (audio-duck muffle) rides the same detectors: hot blocks on a
+voice stream are classified direct-vs-muffled by high-band share, muffled-only
+activity stops triggering the duck AND is dipped on the voice chains' own
+duck-gain stage (idle for voice chains otherwise). See the block comment above
+_muffle for the full mechanism.
+
 The daemon is event-driven (pactl subscribe), never polls the graph. It publishes
 the applied per-slot gain for the bar to draw the "balance adjustment" arc:
   ~/.local/state/qs-audio/balance.json
@@ -136,7 +142,10 @@ def load_duck_config():
     cfg = {"enabled": False, "duck_db": 8.0, "threshold_db": -40.0,
            "hold_ms": 900, "voice_apps": ["vesktop"],
            "adaptive": True, "margin_db": 1.0,
-           "mic_trigger": False, "mic_threshold_db": -35.0}
+           "mic_trigger": False, "mic_threshold_db": -35.0,
+           "muffle_mode": "off", "muffle_hf_db": -16.0,
+           "muffle_gate_db": 24.0, "muffle_engage_ms": 350,
+           "muffle_release_ms": 700, "muffle_direct_ms": 700}
     try:
         with open(DUCK_CONFIG) as f:
             c = json.load(f)
@@ -172,6 +181,20 @@ def load_duck_config():
         # tighter hold still bridges word gaps; the slow release glide
         # covers sentence gaps.
         cfg["mic_hold_ms"] = max(100, int(c.get("mic_hold_ms", 450)))
+        # Muffle gate (see the _muffle block comment): "off" = plain RMS gate,
+        # "log" = classify + journal only (threshold tuning, behaviour
+        # unchanged), "on" = muffled-only blocks neither trigger the duck nor
+        # stay audible. muffle_hf_db is the high-band share (dB, negative) a
+        # hot block needs to count as direct speech.
+        m = str(c.get("muffle_mode", "off")).lower()
+        cfg["muffle_mode"] = m if m in ("off", "log", "on") else "off"
+        cfg["muffle_hf_db"] = max(-40.0, min(0.0,
+                                             float(c.get("muffle_hf_db", -16.0))))
+        cfg["muffle_gate_db"] = max(3.0, min(60.0,
+                                             float(c.get("muffle_gate_db", 24.0))))
+        cfg["muffle_engage_ms"] = max(100, int(c.get("muffle_engage_ms", 350)))
+        cfg["muffle_release_ms"] = max(200, int(c.get("muffle_release_ms", 700)))
+        cfg["muffle_direct_ms"] = max(200, int(c.get("muffle_direct_ms", 700)))
     except Exception:
         pass
     cfg["factor"] = 10.0 ** (-cfg["duck_db"] / 60.0)      # pulse-% (cubic) domain
@@ -735,6 +758,175 @@ def _duck_tick():
     _duck_set_target(0.0)
 
 
+# ------------------------------------------------------------- muffle gate
+# Someone ELSE talking in a caller's room reads as speech to the plain RMS
+# gate: it ducked whatever was playing and stayed audible as chatter. Direct
+# on-mic speech carries consonant/sibilant energy well above 2 kHz; room-
+# muffled speech is low-passed and does not. Each hot 50 ms block's HIGH-BAND
+# SHARE (first-difference RMS over full RMS, in dB — a one-sample diff is a
+# 6 dB/oct high-pass, no FFT needed) classifies it: above muffle_hf_db it is
+# direct speech. Direct evidence stays fresh for muffle_direct_ms so vowel-
+# only blocks mid-sentence still count as speech. Hot blocks with NO fresh
+# direct evidence are muffled-only: they do not trigger the duck, and once
+# they sustain for muffle_engage_ms the VOICE chains' duck-gain stage (idle
+# for voice chains otherwise — ducking never targets them) dips them by
+# muffle_gate_db. Any direct block reopens the gate at once — close is slow,
+# open is fast, so a real onset loses at most one detection block. Both
+# voices share one mixed stream, so overlap passes through untouched: only
+# ISOLATED muffled talk is gated. Chain-hosted voice streams only; unmanaged
+# voice streams still get the trigger filtering.
+_muffle = {"direct_ts": 0.0, "noise_since": None, "deadline": 0.0,
+           "gate": False, "timer": None}
+_muffle_lock = threading.Lock()
+_muffle_ramp = {"f": 0.0, "target": 0.0}   # 0 = open (unity), 1 = fully dipped
+_muffle_ramp_cv = threading.Condition()
+MUFFLE_CLOSE_S = 0.35
+MUFFLE_OPEN_S = 0.06
+MUFFLE_TICK = 0.02
+
+
+def _muffle_direct_fresh(now=None):
+    return ((now if now is not None else time.monotonic())
+            - _muffle["direct_ts"] <= _duck_cfg["muffle_direct_ms"] / 1000.0)
+
+
+def _muffle_gain(f):
+    if f <= 0:
+        return 1.0
+    return 10.0 ** (-(_duck_cfg["muffle_gate_db"] * f) / 20.0)
+
+
+def _muffle_set_target(t):
+    with _muffle_ramp_cv:
+        _muffle_ramp["target"] = t
+        _muffle_ramp_cv.notify()
+
+
+def _muffle_apply_f(f):
+    try:
+        with _recon_lock:
+            g = _muffle_gain(f)
+            for name in list(_duck_fast["voice_chains"]):
+                _duck_set_chain_gain(name, g)
+    except Exception:
+        pass
+
+
+def _muffle_ramp_worker():
+    while True:
+        with _muffle_ramp_cv:
+            if _muffle_ramp["f"] == _muffle_ramp["target"]:
+                _muffle_ramp_cv.wait()
+                continue
+            tgt = _muffle_ramp["target"]
+            f = _muffle_ramp["f"]
+            if tgt > f:
+                f = min(tgt, f + MUFFLE_TICK / MUFFLE_CLOSE_S)
+            else:
+                f = max(tgt, f - MUFFLE_TICK / MUFFLE_OPEN_S)
+            _muffle_ramp["f"] = f
+        _muffle_apply_f(f)
+        if _muffle_ramp["f"] != _muffle_ramp["target"]:
+            with _muffle_ramp_cv:
+                _muffle_ramp_cv.wait(MUFFLE_TICK)
+
+
+def _set_voice_chains(new):
+    """Voice-chain set changes flow through here so the muffle gate's gain
+    follows the streams: chains that left reset to unity (they may become
+    duck targets this same pass), chains that joined mid-gate pick up the
+    current dip."""
+    old = _duck_fast["voice_chains"]
+    _duck_fast["voice_chains"] = new
+    f = _muffle_ramp["f"]
+    for name in old - new:
+        _duck_set_chain_gain(name, 1.0)
+    if f > 0:
+        for name in new - old:
+            _duck_set_chain_gain(name, _muffle_gain(f))
+
+
+def _muffle_cfg_check():
+    """Mode left "on" with the gate still dipped (config change mid-gate) —
+    reopen. The state flags clear via the release timer."""
+    if _duck_cfg["muffle_mode"] != "on" and (
+            _muffle_ramp["f"] > 0 or _muffle_ramp["target"] > 0):
+        _muffle_set_target(0.0)
+
+
+def _muffle_tick():
+    # Re-arming release timer, same shape as _duck_tick: muffled blocks only
+    # push the deadline forward.
+    with _muffle_lock:
+        remain = _muffle["deadline"] - time.monotonic()
+        if remain > 0.05 and _duck_cfg["muffle_mode"] != "off":
+            t = threading.Timer(remain, _muffle_tick)
+            t.daemon = True
+            _muffle["timer"] = t
+            t.start()
+            return
+        _muffle["timer"] = None
+        opened = _muffle["gate"]
+        _muffle["gate"] = False
+        _muffle["noise_since"] = None
+    if opened:
+        _muffle_set_target(0.0)
+        print("muffle: background talk ended — gate open", flush=True)
+
+
+def _muffle_block(direct, ratio_db):
+    """One HOT block's classification → muffle state. Returns True when the
+    block counts as speech (direct, or direct evidence still fresh) and may
+    trigger the duck."""
+    mode = _duck_cfg["muffle_mode"]
+    now = time.monotonic()
+    began = closed = opened = False
+    with _muffle_lock:
+        if direct:
+            _muffle["direct_ts"] = now
+            _muffle["noise_since"] = None
+            if _muffle["gate"]:
+                _muffle["gate"] = False
+                opened = True
+            trigger = True
+        elif _muffle_direct_fresh(now):
+            trigger = True       # vowel tail of direct speech, not background
+        else:
+            # Muffled-only activity. A gap past the release deadline restarts
+            # the engage clock — a lone blip minutes later must not close the
+            # gate instantly off a stale noise_since.
+            if _muffle["noise_since"] is None or now > _muffle["deadline"]:
+                _muffle["noise_since"] = now
+                began = True
+            _muffle["deadline"] = now + _duck_cfg["muffle_release_ms"] / 1000.0
+            if (not _muffle["gate"] and now - _muffle["noise_since"]
+                    >= _duck_cfg["muffle_engage_ms"] / 1000.0):
+                _muffle["gate"] = True
+                closed = True
+                if _muffle["timer"] is None:
+                    t = threading.Timer(
+                        _duck_cfg["muffle_release_ms"] / 1000.0, _muffle_tick)
+                    t.daemon = True
+                    _muffle["timer"] = t
+                    t.start()
+            trigger = False
+    if mode == "on":
+        if opened:
+            _muffle_set_target(0.0)
+        elif closed:
+            _muffle_set_target(1.0)
+    if began:
+        print("muffle: muffled-only talk (hf %.1f dB)" % ratio_db, flush=True)
+    if closed:
+        print("muffle%s: gate closed (-%.0f dB on voice chains)"
+              % ("" if mode == "on" else "[log]",
+                 _duck_cfg["muffle_gate_db"]), flush=True)
+    if opened:
+        print("muffle: direct speech (hf %.1f dB) — gate open" % ratio_db,
+              flush=True)
+    return trigger
+
+
 def _duck_reader(sid, stop):
     """RMS speech gate on one voice stream's own audio. --monitor-stream taps
     the raw stream data (pre-volume), so user volume settings don't move the
@@ -752,6 +944,7 @@ def _duck_reader(sid, stop):
     except Exception:
         return
     block = int(48000 * 4 * 0.05)        # 50 ms blocks: fast attack
+    prev = 0.0                           # last sample, diff across block edges
     try:
         while not stop.is_set():
             buf = p.stdout.read(block)
@@ -761,11 +954,29 @@ def _duck_reader(sid, stop):
             a.frombytes(buf[:len(buf) // 4 * 4])
             if not len(a):
                 continue
+            mode = _duck_cfg["muffle_mode"]
             s = 0.0
-            for v in a:
-                s += v * v
+            if mode == "off":
+                for v in a:
+                    s += v * v
+            else:
+                sd = 0.0
+                for v in a:
+                    s += v * v
+                    d = v - prev
+                    sd += d * d
+                    prev = v
             if math.sqrt(s / len(a)) > 10.0 ** (_duck_cfg["threshold_db"] / 20.0):
-                _duck_voice_heard()
+                if mode == "off":
+                    _duck_voice_heard()
+                else:
+                    # high-band share: first-difference energy over full
+                    # energy — 10·log10 because both are already squared sums
+                    ratio = 10.0 * math.log10(sd / s) if sd > 0 else -99.0
+                    speech = _muffle_block(
+                        ratio > _duck_cfg["muffle_hf_db"], ratio)
+                    if speech or mode == "log":
+                        _duck_voice_heard()
     finally:
         try:
             p.kill()
@@ -1281,6 +1492,7 @@ def _reconcile_locked():
     # reconcile and this guard falls through.
     global _duck_cfg
     _duck_cfg = load_duck_config()
+    _muffle_cfg_check()
     enabled = load_config()["output_enabled"]
     fx_rules = load_fx_rules()
     if not enabled and not fx_rules:
@@ -1300,7 +1512,7 @@ def _reconcile_locked():
             except Exception:
                 return
             _duck_manage_readers(streams)
-            _duck_fast["voice_chains"] = set()
+            _set_voice_chains(set())
             _duck_sync_chains(set())        # nothing parked on chains here
             engaged = _duck_engaged()
             _duck_raw(streams, _sink_index_to_name(), set(), engaged)
@@ -1448,7 +1660,7 @@ def _reconcile_locked():
             _slot_stream.clear()
         if trims_dirty:
             _save_trims()
-        _duck_fast["voice_chains"] = voice_chains
+        _set_voice_chains(voice_chains)
         _duck_sync_chains(duck_chains)
         _duck_raw(streams, sink_name, fx_ids, duck_on)
         _duck_raw_state["applied"] = duck_on
@@ -1587,7 +1799,7 @@ def _reconcile_locked():
     for slot in list(_slot_stream.keys()):
         if slot not in _assign:
             _slot_stream.pop(slot, None)
-    _duck_fast["voice_chains"] = voice_chains
+    _set_voice_chains(voice_chains)
     _duck_sync_chains(duck_chains)
     # Streams no chain covers (pool overflow) still dip their own volume.
     _duck_raw(streams, sink_name, set(_assign.values()) | fx_ids, duck_on)
@@ -1684,7 +1896,9 @@ def _publish():
                "duck": {"enabled": _duck_cfg["enabled"],
                         "active": _duck["active"],
                         "db": _duck_cfg["duck_db"],
-                        "mic": _duck_cfg["mic_trigger"]}}
+                        "mic": _duck_cfg["mic_trigger"],
+                        "muffle": _duck_cfg["muffle_mode"],
+                        "muffle_gate": _muffle["gate"]}}
         if obj != _last_published:
             _last_published = obj
             _atomic_write(obj)
@@ -1738,6 +1952,8 @@ def cmd_daemon(_args):
     threading.Thread(target=_avrcp_watch, daemon=True).start()
     # Duck ramp worker: slides volumes between base and dipped on duck edges.
     threading.Thread(target=_duck_ramp_worker, daemon=True).start()
+    # Muffle gate ramp: slides the voice chains' gain on gate edges.
+    threading.Thread(target=_muffle_ramp_worker, daemon=True).start()
 
     reconcile()   # first paint
     # Periodic light refresh keeps the published gain arc live while assigned

@@ -4985,6 +4985,23 @@ let
   #                                  nearly imperceptible; 6+ is clearly heard).
   #   audio-duck adaptive [1|0|toggle]
   #                                → adaptive dip sizing vs fixed duck_db.
+  #   audio-duck muffle [on|off|log|toggle]
+  #                                → muffled-bleed handling: background talk in
+  #                                  a CALLER's room (low-passed, no high-band
+  #                                  energy) stops triggering the duck and is
+  #                                  dipped on the voice chains while it is the
+  #                                  only thing audible. "log" classifies and
+  #                                  journals only (threshold tuning), no
+  #                                  behaviour change.
+  #   audio-duck muffle-level <dB> → how far isolated muffled talk dips (3-60,
+  #                                  default 24).
+  #   audio-duck muffle-ratio <dB> → high-band share a block needs to count as
+  #                                  direct speech, as dB below the full-band
+  #                                  level (5-40, default 16). HIGHER = more
+  #                                  blocks count as direct (less filtering).
+  #                                  Timing knobs (muffle_engage_ms /
+  #                                  muffle_release_ms / muffle_direct_ms) are
+  #                                  config-file-only.
   duck-config-path = ''"''${XDG_CONFIG_HOME:-$HOME/.config}/audio-duck/config.json"'';
 
   duck-sh = pkgs.writeShellScriptBin "audio-duck" ''
@@ -5000,11 +5017,14 @@ let
                  "mic|" + (if (.mic_trigger // false) then "1" else "0" end),
                  "miclevel|\(.mic_duck_db // 15)",
                  "micthreshold|\((.mic_threshold_db // -35) | -.)",
+                 "muffle|\(.muffle_mode // "off")",
+                 "mufflelevel|\(.muffle_gate_db // 24)",
+                 "muffleratio|\((.muffle_hf_db // -16) | -.)",
                  ((.voice_apps // ["vesktop"])[] | "prio|" + ascii_downcase)' \
             "$cfg" 2>/dev/null \
-            || { echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "micthreshold|35"; echo "prio|vesktop"; }
+            || { echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "micthreshold|35"; echo "muffle|off"; echo "mufflelevel|24"; echo "muffleratio|16"; echo "prio|vesktop"; }
         else
-          echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "micthreshold|35"; echo "prio|vesktop"
+          echo "enabled|0"; echo "level|8"; echo "adaptive|1"; echo "margin|1"; echo "mic|0"; echo "miclevel|15"; echo "micthreshold|35"; echo "muffle|off"; echo "mufflelevel|24"; echo "muffleratio|16"; echo "prio|vesktop"
         fi
         state="''${XDG_STATE_HOME:-$HOME/.local/state}/qs-audio/balance.json"
         { [ -f "$state" ] && jq -r \
@@ -5122,6 +5142,41 @@ let
         tmp=$(mktemp)
         jq --argjson d "$db" '.mic_duck_db = $d' "$cfg" > "$tmp"
         if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      muffle)
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        case "''${2:-toggle}" in
+          on|off|log) jq --arg m "$2" '.muffle_mode = $m' "$cfg" > "$tmp" ;;
+          toggle) jq '.muffle_mode = (if (.muffle_mode // "off") == "on" then "off" else "on" end)' "$cfg" > "$tmp" ;;
+          *) rm -f "$tmp"; echo "usage: audio-duck muffle [on|off|log|toggle]" >&2; exit 1 ;;
+        esac
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      muffle-level)
+        db="''${2:-}"
+        case "$db" in
+          ""|*[!0-9]*) echo "usage: audio-duck muffle-level <3-60 dB>" >&2; exit 1 ;;
+        esac
+        [ "$db" -lt 3 ] && db=3
+        [ "$db" -gt 60 ] && db=60
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        jq --argjson d "$db" '.muffle_gate_db = $d' "$cfg" > "$tmp"
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
+      muffle-ratio)
+        # Stored negative (dB vs full-band); entered positive, like mic-threshold.
+        db="''${2:-}"
+        case "$db" in
+          ""|*[!0-9]*) echo "usage: audio-duck muffle-ratio <5-40 dB below full-band>" >&2; exit 1 ;;
+        esac
+        [ "$db" -lt 5 ] && db=5
+        [ "$db" -gt 40 ] && db=40
+        mkdir -p "$(dirname "$cfg")"
+        [ -f "$cfg" ] || echo '{"enabled":false,"duck_db":8}' > "$cfg"
+        tmp=$(mktemp)
+        jq --argjson d "$db" '.muffle_hf_db = -$d' "$cfg" > "$tmp"
+        if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
       mic-threshold)
         # Stored negative (dBFS); entered positive as "dB below full scale".
         db="''${2:-}"
@@ -5136,7 +5191,7 @@ let
         jq --argjson d "$db" '.mic_threshold_db = -$d' "$cfg" > "$tmp"
         if [ -s "$tmp" ]; then mv "$tmp" "$cfg"; else rm -f "$tmp"; fi ;;
       *)
-        echo "usage: audio-duck [read|toggle|1|0|set-level <dB>|mic [toggle|1|0]|mic-level <dB>|mic-threshold <dB>|prio <id|key> [toggle|1|0]]" >&2
+        echo "usage: audio-duck [read|toggle|1|0|set-level <dB>|mic [toggle|1|0]|mic-level <dB>|mic-threshold <dB>|muffle [on|off|log|toggle]|muffle-level <dB>|muffle-ratio <dB>|prio <id|key> [toggle|1|0]]" >&2
         exit 1 ;;
     esac
     # Nudge the daemon to re-read config + reconcile now (event-driven).
