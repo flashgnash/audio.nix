@@ -3,7 +3,12 @@
 # config (which passes inputs.pipewire-screenaudio). Import as:
 #   (import ./pipewire.nix pipewire-screenaudio-flake)
 pipewire-screenaudio:
-{ pkgs, ... }:
+{
+  pkgs,
+  lib,
+  config,
+  ...
+}:
 
 {
 
@@ -53,7 +58,10 @@ pipewire-screenaudio:
 
   programs.noisetorch.enable = true;
 
-  services.pipewire = {
+  # Only with the legacy stack (modules/audio-stack.nix): chainmail brings
+  # its own PipeWire/WirePlumber setup. The RT limits above, noisetorch and
+  # the packages below stay with either.
+  services.pipewire = lib.mkIf (config.audio.stack == "legacy") {
     enable = true;
     alsa.enable = true;
     alsa.support32Bit = true;
