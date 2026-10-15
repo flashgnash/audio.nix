@@ -1,8 +1,10 @@
-# PipeWire audio stack, parameterised on the pipewire-screenaudio flake so it
-# works both from the subflake (which binds its own input) and from the parent
-# config (which passes inputs.pipewire-screenaudio). Import as:
-#   (import ./pipewire.nix pipewire-screenaudio-flake)
-pipewire-screenaudio:
+# The legacy PipeWire audio stack: RNNoise denoised virtual source, echo
+# cancellation, hot-plug mic combiner, per-app balance sinks, noisetorch.
+# With ./tools-module.nix it is module-sets' legacy-audio-modules, which no
+# host includes now (chainmail, services.chainmail, is the default). Its
+# switch, and the assertion keeping it apart from chainmail: ./legacy.nix.
+# What either stack needs (RT limits, device fixes, pactl, Firefox's
+# screen-audio host) is ./common.nix.
 {
   pkgs,
   lib,
@@ -11,59 +13,12 @@ pipewire-screenaudio:
 }:
 
 {
-  imports = [ ./device-rules.nix ];
-
-  security.rtkit.enable = true;
-
-  # Allow latency-sensitive audio HELPERS (not just PipeWire's own rtkit-managed
-  # threads) to obtain real-time scheduling, so a saturated CPU — a screen-cast
-  # encoder, share, game — can't starve them into stutter. The tailnet route's
-  # parec/gst capture is the motivating case: it must preempt the cast, not
-  # queue behind it. The helper requests a modest FIFO priority BELOW PipeWire's
-  # own; this only raises the ceiling (processes still run normally unless they
-  # explicitly ask for RT).
-  #   - loginLimits: interactive / graphical PAM sessions (terminal launches).
-  #   - systemd DefaultLimitRTPRIO: the route is usually launched from the
-  #     quickshell audio panel, i.e. under `systemd --user`, which does NOT get
-  #     pam_limits — the user@ manager's own ceiling must be raised for its
-  #     services (and their children) to go RT.
-  # NB nice MUST be raised alongside rtprio: PipeWire's module-rt renices to
-  # -11 BEFORE taking RT, and when that first setpriority() fails (hard nice
-  # cap 0) it abandons the WHOLE RT setup — rtprio ceiling and all — leaving
-  # every data-loop at plain SCHED_OTHER. Verified live 2026-10-06: rtprio
-  # 95/95 present, data-loops still TS, "could not set nice-level to -11:
-  # Permission denied" in the log; audio crackled whenever a nix build
-  # saturated the CPU.
-  security.pam.loginLimits = [
-    {
-      domain = "@audio";
-      item = "rtprio";
-      type = "-";
-      value = "95";
-    }
-    {
-      domain = "@audio";
-      item = "nice";
-      type = "-";
-      value = "-19";
-    }
-  ];
-  systemd.settings.Manager.DefaultLimitRTPRIO = 95;
-  systemd.settings.Manager.DefaultLimitNICE = "-19";
-  systemd.user.extraConfig = ''
-    DefaultLimitRTPRIO=95
-    DefaultLimitNICE=-19
-  '';
-
-  services.pulseaudio.enable = false;
+  imports = [ ./legacy.nix ];
 
   # The legacy denoiser; chainmail has its own (noise-filter).
-  programs.noisetorch.enable = config.audio.stack == "legacy";
+  programs.noisetorch.enable = config.audio.legacy.enable;
 
-  # Only with the legacy stack (modules/audio-stack.nix): chainmail brings
-  # its own PipeWire/WirePlumber setup. The RT limits above and the packages
-  # below stay with either.
-  services.pipewire = lib.mkIf (config.audio.stack == "legacy") {
+  services.pipewire = lib.mkIf config.audio.legacy.enable {
     enable = true;
     alsa.enable = true;
     alsa.support32Bit = true;
@@ -867,16 +822,4 @@ pipewire-screenaudio:
         ];
       };
   };
-
-  environment.systemPackages = with pkgs; [
-    playerctl
-    pulseaudio
-
-    (firefox.override {
-      nativeMessagingHosts = [
-        pipewire-screenaudio.packages.${pkgs.stdenv.hostPlatform.system}.default
-      ];
-    })
-  ];
-
 }

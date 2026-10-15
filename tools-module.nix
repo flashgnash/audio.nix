@@ -14,10 +14,15 @@ let
   cfg = config.programs.audioctl;
 in
 {
+  # Part of the legacy stack: its switch (audio.legacy.enable) and the
+  # assertion keeping it apart from chainmail.
+  imports = [ ./legacy.nix ];
+
   options.programs.audioctl.enable =
     lib.mkEnableOption "audio backend tools (audioctl + daemons)"
     // {
-      default = true;
+      default = config.audio.legacy.enable;
+      defaultText = lib.literalExpression "config.audio.legacy.enable";
     };
 
   config = lib.mkIf cfg.enable {

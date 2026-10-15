@@ -1,6 +1,5 @@
 # Device fixes for this machine's audio hardware, whichever stack runs
-# (modules/audio-stack.nix): imported by pipewire.nix outside its
-# legacy-only block.
+# (chainmail or the legacy one): imported by common.nix.
 {
   # Keep USB capture devices OUT of the graph-driver role. A full-speed USB
   # mic (PodMic) defaults to priority.driver 2100 — ABOVE every output sink

@@ -25,7 +25,14 @@
         # Fully wired — the pipewire-screenaudio dependency is bound to this
         # flake's own input, so consumers just add the module; no specialArgs
         # plumbing required.
-        pipewire = import ./pipewire.nix pipewire-screenaudio;
+        # The legacy stack (./pipewire.nix) with what any stack needs
+        # (./common.nix: RT limits, device fixes, Firefox's screen-audio host).
+        pipewire = {
+          imports = [
+            (import ./common.nix pipewire-screenaudio)
+            ./pipewire.nix
+          ];
+        };
 
         # audio-* CLI tools + audioctl dispatcher + the xrun-guard/auto-mic
         # user daemons. Any UI can be built over these; gate on
