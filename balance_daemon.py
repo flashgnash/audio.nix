@@ -1576,16 +1576,6 @@ def _reconcile_locked():
         # sits on a real output and flows through here normally.
         if cur_sink.startswith("discord_user_"):
             continue
-        # A stream the per-player cast button routed onto a cast null-sink
-        # (castaudio_<device>, created by castAudio) is pinned there to cast
-        # JUST that player — exactly like the per-user case above. Leaving it
-        # be is what makes per-stream casting work: otherwise the slot
-        # reconcile below yanks it straight back onto its applvl.<n> leveler,
-        # emptying the cast sink (silence on the device). castAudio tears the
-        # sink down when the cast ends, so the stream rejoins the pool on its
-        # own — no explicit un-pin needed here.
-        if cur_sink.startswith("castaudio_"):
-            continue
         streams_by_id[si["id"]] = si
 
     with _slot_gain_lock:

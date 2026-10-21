@@ -119,21 +119,20 @@ let
       # bridge streams are deliberately NOT masked: they are the per-user
       # gauges in the app mixer.
       if (name ~ /^discord_user_/) return 1
-      # mix-sync / cast-sync fixed-delay wrappers (delayed.<node>) plus
-      # the pw-loopback instances behind them: sync.<mic>, castsync.<sink>
-      # and bare pw-loopback fallback names — represented by the real
-      # device they wrap.
+      # mix-sync fixed-delay wrappers (delayed.<mic>) plus the pw-loopback
+      # instances behind them (sync.<mic>, bare pw-loopback fallback names)
+      # — represented by the real device they wrap.
       if (name ~ /^delayed\./) return 1
-      if (name ~ /^sync\./ || name ~ /^castsync\./) return 1
+      if (name ~ /^sync\./) return 1
       if (name ~ /^pw-loopback/) return 1
       # kernel snd_aloop card (guest-gaming plumbing): the input half
       # would pipe played audio into the mic mix, the output half must
       # never receive mirrored audio. Substring match — covers both the
       # alsa_input. and alsa_output. halves (Loopback Analog Stereo).
       if (name ~ /platform-snd_aloop/) return 1
-      # chromecast plumbing: castaudio_<dev> (audio-cast null-sink) and
-      # cast_<dev> (screen-mirror capture sink) — the cast UI / device
-      # row is the representation.
+      # chromecast plumbing: castaudio_<dev> (the null-sink of a chainmail cast
+      # session) and cast_<dev> (screen-mirror capture sink) — the cast
+      # UI / device row is the representation.
       if (name ~ /^castaudio_/ || name ~ /^cast_/) return 1
       # tailnet-audio mic plumbing: donation null-sink (tailnet-mic-),
       # mic-consume receiver null-sink (tailnet-inmic-) and the consumed
@@ -337,10 +336,10 @@ let
   '';
 
   # These three combine-management scripts use bare awk/grep/cat/pactl and are called
-  # from MINIMAL-PATH systemd services (audio-devices, cast-sync, mesh hold-open). A
-  # user service's PATH lacks gawk → bare `awk` is command-not-found → the script
-  # silently no-ops mid-pipeline (this is the class of bug that made cast-sync never
-  # apply). Make them self-contained: prepend the tools they need.
+  # from MINIMAL-PATH systemd services (audio-devices, mesh hold-open). A user
+  # service's PATH lacks gawk → bare `awk` is command-not-found → the script
+  # silently no-ops mid-pipeline. Make them self-contained: prepend the tools they
+  # need.
   combineToolPath = "${pkgs.pulseaudio}/bin:${pkgs.gawk}/bin:${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin";
   outdup-toggle-sh = pkgs.writeShellScriptBin "audio-outdup-toggle" ''
     export PATH="${combineToolPath}:$PATH"
@@ -400,26 +399,17 @@ let
     # the audio-devices daemon keeps their route alive and writes the live proxy
     # sink name here so we can fold it into the combine slaves.
     proxymap="''${XDG_RUNTIME_DIR:-/tmp}/audio-mix/mesh-proxies"
-    # Cast-sync: when ON, a real LOCAL slave X is served through its delay wrapper
-    # `delayed.X` (spawned by the cast-sync daemon) so it lags to match the cast's
-    # buffer. The cast sink (castaudio_*) and mesh proxies (tailnet-out-*) stay raw
-    # — they are the network-buffered references everything else aligns to.
-    sync_on=1
-    [ -f "''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/disabled" ] && sync_on=0
-    # Slave candidates: everything real, PLUS the two internal families that
-    # ARE legitimate combine members and so get carved back in — delayed.<sink>
-    # cast-sync wrappers (substituted for their real sink below) and cast
-    # proxies (castaudio_/cast_, the cast IS a mix member). The rest of the
-    # canonical internal_node() mask must never be slaved: combined_out itself,
+    # Slave candidates: everything real, PLUS screen-cast sinks (cast_<dev>, the
+    # cast IS a mix member), carved back in from the internal mask. The rest of
+    # the canonical internal_node() mask must never be slaved: combined_out itself,
     # the applvl pool, snd_aloop (mirroring into it would pipe host audio into
     # the guest capture side) and the tailnet mic sinks (mirroring into a
     # donated/consumed mic would echo output into that mic).
     present=$(pactl list short sinks 2>/dev/null | awk '
       ${audio-naming-awk}
-      $2 ~ /^(delayed\.|castaudio_|cast_)/ || !internal_node($2) { print $2 }')
+      $2 ~ /^cast_/ || !internal_node($2) { print $2 }')
     # Mix-set entries to fold in: the configured .sinks[], or — when empty ("all
-    # sinks" mode) — every present sink, run through the SAME loop below so the
-    # cast-sync delay substitution applies in all-sinks mode too.
+    # sinks" mode) — every present sink.
     entries=$([ -f "$cfg" ] && ${pkgs.jq}/bin/jq -r '(.sinks // [])[]' "$cfg" 2>/dev/null)
     [ -z "$entries" ] && entries="$present"
     slaves=""
@@ -436,15 +426,7 @@ let
             && slaves="$slaves''${slaves:+,}$px" ;;
         *)
           printf '%s\n' "$present" | grep -qxF "$s" || continue
-          emit="$s"
-          case "$s" in
-            alsa_*|bluez_*)
-              if [ "$sync_on" = 1 ] \
-                 && printf '%s\n' "$present" | grep -qxF "delayed.$s"; then
-                emit="delayed.$s"
-              fi ;;
-          esac
-          slaves="$slaves''${slaves:+,}$emit" ;;
+          slaves="$slaves''${slaves:+,}$s" ;;
       esac
     done < <(printf '%s\n' "$entries")
     [ -z "$slaves" ] && slaves=$(printf '%s\n' "$present" | ${pkgs.coreutils}/bin/paste -sd,)
@@ -487,13 +469,12 @@ let
   list-dup-sinks-sh = pkgs.writeShellScriptBin "audio-list-dup-sinks" ''
     sinks=$(pactl list sinks | awk '
       ${audio-naming-awk}
-      # This lookup map deliberately keeps the two internal families that ARE
-      # legitimate combine members (mirroring the mixset-slaves carve-out):
-      # delayed.<sink> cast-sync wrappers (re-labelled to the real device
-      # below) and cast proxies (castaudio_/cast_). Everything else in the
-      # canonical internal_node() mask is dropped so internal plumbing —
-      # which mixset-slaves refuses to slave anyway — never grows a mixer row.
-      function keep(n) { return n ~ /^(delayed\.|castaudio_|cast_)/ || !internal_node(n) }
+      # This lookup map deliberately keeps screen-cast sinks (cast_<dev>), the
+      # one internal family that IS a legitimate combine member (mirroring the
+      # mixset-slaves carve-out). Everything else in the canonical
+      # internal_node() mask is dropped so internal plumbing — which
+      # mixset-slaves refuses to slave anyway — never grows a mixer row.
+      function keep(n) { return n ~ /^cast_/ || !internal_node(n) }
       function emit() { if (name != "" && keep(name)) printf "%s|%s|%s\n", idx, name, display_name(port, alsa_card, alsa_device, desc) }
       /^Sink #/ { emit(); idx = substr($2, 2); name=""; desc=""; port=""; alsa_card=""; alsa_device="" }
       /^\tName:/        { name = $2 }
@@ -509,16 +490,6 @@ let
         for (i = 1; i <= n; i++) {
           split(lines[i], f, "|")
           snkname[f[1]] = f[2]; snkdisp[f[1]] = f[3]
-          dispByName[f[2]] = f[3]
-        }
-        # A cast-sync delay wrapper (delayed.<sink>) stands in for its real output
-        # while SYNC is on: show the row under the real device name, not the
-        # wrapper (cast sync) description, so the mixer stays recognisable.
-        for (k in snkname) {
-          if (snkname[k] ~ /^delayed\./) {
-            real = substr(snkname[k], 9)
-            if (real in dispByName) snkdisp[k] = dispByName[real]
-          }
         }
       }
       function flush() {
@@ -1132,7 +1103,7 @@ let
     # excluding the snd_aloop guest-gaming loopback which is playback fed back
     # in) OR one of the internal virtual sources that carries real mic audio and
     # is what normal apps actually capture: the RNNoise source (the denoised
-    # default), the mic-blend combiner, the mix/cast-sync `delayed.<mic>`
+    # default), the mic-blend combiner, the mix-sync `delayed.<mic>`
     # wrappers, and consumed remote mics from the tailnet mesh (tailnet-rmic-).
     mic_sources=$(pactl list sources 2>/dev/null | awk '
       /^Source #/          { idx = substr($2, 2) }
@@ -1145,7 +1116,7 @@ let
         if (name ~ /^bluez_input\./)   ok = 1   # bluetooth mic
         if (name == "rnnoise_source")  ok = 1   # denoised default source
         if (name == "combined_mics")   ok = 1   # mic-blend combiner
-        if (name ~ /^delayed\./)       ok = 1   # mix/cast-sync mic wrappers
+        if (name ~ /^delayed\./)       ok = 1   # mix-sync mic wrappers
         if (name ~ /^tailnet-rmic-/)   ok = 1   # consumed remote mesh mic
         if (ok) print idx
       }
@@ -2695,7 +2666,7 @@ let
       # Internal plumbing streams are not apps — the canonical internal_node()
       # mask hides them: output.combined_out* duplicator streams get their own
       # rows in the dup-sink mixer of the popup, applvl.<n>.out balance-pool
-      # bridges would show as phantom "Unknown" gauges, and the sync/castsync
+      # bridges would show as phantom "Unknown" gauges, and the sync.<mic>
       # loopback playback halves are represented by their device rows. Streams
       # that are deliberately app-LIKE (soundboard, tailnet-route-recv,
       # discordpeer.<id>.out per-user bridges) are not in the mask and keep
@@ -4614,96 +4585,6 @@ let
     echo done
   '';
 
-  # ── Cast audio time-sync ────────────────────────────────────────────────────
-  # Auto-measures a Chromecast cast's end-to-end latency and delays the local MIX
-  # outputs to match (via `delayed.<sink>` wrappers folded into combined_out by
-  # mixset-slaves). Only meaningful while a cast is a member of the output MIX set.
-  cast-sync-daemon-py = pkgs.writeText "cast-sync-daemon.py" (
-    builtins.readFile ../../scripts/cast_sync_daemon.py
-  );
-  # gawk/gnugrep/coreutils are REQUIRED on PATH: the daemon shells out to
-  # outdup-reload + mixset-slaves, which use bare `awk`/`grep`/`cat`. A systemd user
-  # service's PATH is minimal (no gawk), so without this the reload silently no-ops
-  # (mixset-slaves → empty → `outdup-reload` bails) and the delay never reaches the
-  # combine — sync measures but never applies.
-  cast-sync-daemon-sh = pkgs.writeShellScriptBin "audio-cast-sync-daemon" ''
-    export PATH="${pkgs.pulseaudio}/bin:${pkgs.pipewire}/bin:${pkgs.gawk}/bin:${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin:${outdup-reload-sh}/bin:${mixset-slaves-sh}/bin:$PATH"
-    exec ${pkgs.python3}/bin/python ${cast-sync-daemon-py}
-  '';
-
-  # Manual sync trim, PER cast device (each Chromecast buffers differently). Targets
-  # the currently-active cast (from its marker):
-  #   audio-cast-sync-offset              → print this device's trim (seconds)
-  #   audio-cast-sync-offset <delta>      → ADD delta (e.g. 0.05 / -0.05), print new
-  #   audio-cast-sync-offset set <value>  → SET absolute trim, print new
-  # The daemon re-reads it every tick, so changes are live.
-  cast-sync-offset-sh = pkgs.writeShellScriptBin "audio-cast-sync-offset" ''
-    marker="''${XDG_RUNTIME_DIR:-/tmp}/castaudio/active"
-    device=$(${pkgs.gawk}/bin/awk -F= '$1=="device"{print $2}' "$marker" 2>/dev/null)
-    if [ -z "$device" ]; then printf '0\n'; exit 0; fi   # no active cast → nothing to trim
-    key=$(printf '%s' "$device" | ${pkgs.coreutils}/bin/tr -c 'A-Za-z0-9' '_')
-    f="''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/offset-$key"
-    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$f")"
-    cur=$(${pkgs.coreutils}/bin/cat "$f" 2>/dev/null || echo 0)
-    if [ "''${1:-}" = set ]; then
-      new=$(${pkgs.gawk}/bin/awk -v v="''${2:-0}" 'BEGIN{ if(v<-5)v=-5; if(v>15)v=15; printf "%.3f", v }')
-      printf '%s\n' "$new" > "$f"; printf '%s\n' "$new"
-    elif [ -n "''${1:-}" ]; then
-      new=$(${pkgs.gawk}/bin/awk -v c="$cur" -v d="$1" \
-        'BEGIN{ v=c+d; if(v<-5)v=-5; if(v>15)v=15; printf "%.3f", v }')
-      printf '%s\n' "$new" > "$f"; printf '%s\n' "$new"
-    else
-      printf '%s\n' "''${cur:-0}"
-    fi
-  '';
-
-  # The effective delay currently applied for the active cast (auto-measured + trim),
-  # in seconds — what the per-card latency readout shows.
-  cast-sync-delay-sh = pkgs.writeShellScriptBin "audio-cast-sync-delay" ''
-    ${pkgs.coreutils}/bin/cat "''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/delay" 2>/dev/null || echo 0
-  '';
-
-  # Mic-based auto-calibrator: plays a chirp into the combine, records a mic that hears
-  # BOTH the local speaker and the cast, cross-correlates the two arrivals, and nudges
-  # the per-device trim until they line up. Needs an active cast + MIX on + a mic.
-  cast-sync-calibrate-py = pkgs.writeText "cast-sync-calibrate.py" (
-    builtins.readFile ../../scripts/cast_sync_calibrate.py
-  );
-  cast-sync-calibrate-sh = pkgs.writeShellScriptBin "audio-cast-sync-calibrate" ''
-    export CAST_SYNC_OFFSET=${cast-sync-offset-sh}/bin/audio-cast-sync-offset
-    export OUTDUP_RELOAD=${outdup-reload-sh}/bin/audio-outdup-reload
-    export PATH="${pkgs.pulseaudio}/bin:$PATH"
-    exec ${pkgs.python3.withPackages (ps: [ ps.numpy ])}/bin/python ${cast-sync-calibrate-py} "$@"
-  '';
-
-  # Sync is ON by default; a `disabled` marker turns it off. Inverted so that the
-  # feature works out of the box (the common case: mix a cast → want it in sync).
-  cast-sync-disabled-path = ''"''${XDG_STATE_HOME:-$HOME/.local/state}/audio-cast-sync/disabled"'';
-
-  cast-sync-status-sh = pkgs.writeShellScriptBin "audio-cast-sync-status" ''
-    if [ -f ${cast-sync-disabled-path} ]; then echo off; else echo on; fi
-  '';
-
-  # Flip "delay local outputs to match the cast" on/off. Default = ON. OFF: write the
-  # disabled marker, rebuild the combine WITHOUT the wrappers first (while they're
-  # still alive → no gap), then stop the daemon (it tears the wrappers down). ON:
-  # remove the marker, start the daemon, and fold the cast in now — the daemon then
-  # spawns the delay wrappers and reloads again.
-  cast-sync-toggle-sh = pkgs.writeShellScriptBin "audio-cast-sync-toggle" ''
-    f=${cast-sync-disabled-path}
-    ${pkgs.coreutils}/bin/mkdir -p "$(${pkgs.coreutils}/bin/dirname "$f")"
-    if [ -f "$f" ]; then
-      ${pkgs.coreutils}/bin/rm -f "$f"
-      ${pkgs.systemd}/bin/systemctl --user start audio-cast-sync >/dev/null 2>&1 || true
-      ${outdup-reload-sh}/bin/audio-outdup-reload >/dev/null 2>&1 || true
-    else
-      : > "$f"
-      ${outdup-reload-sh}/bin/audio-outdup-reload >/dev/null 2>&1 || true
-      ${pkgs.systemd}/bin/systemctl --user stop audio-cast-sync >/dev/null 2>&1 || true
-    fi
-    echo done
-  '';
-
   # Global "recency of use" store for the unified audio device list. `touch <key>`
   # stamps a device (any kind — local sink/source, BT mac, cast name, tailnet
   # host:sink) with the current time; `list` prints `key<TAB>epoch` for the panel
@@ -5413,12 +5294,6 @@ let
     automix-read-sh
     automix-mutate-sh
     mix-sync-daemon-sh
-    cast-sync-daemon-sh
-    cast-sync-status-sh
-    cast-sync-toggle-sh
-    cast-sync-offset-sh
-    cast-sync-delay-sh
-    cast-sync-calibrate-sh
   ];
 
   # Human-facing dispatcher: `audioctl rnnoise-toggle`, `audioctl list-sinks`,
@@ -5450,7 +5325,6 @@ rec {
     automix-daemon-sh
     aec-auto-daemon-sh
     mix-sync-daemon-sh
-    cast-sync-daemon-sh
     balance-daemon-sh
     internal-node-sh
     ;
